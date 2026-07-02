@@ -35,6 +35,20 @@ async function toBytes(source: ArrayBuffer | Response | string): Promise<Uint8Ar
   return new Uint8Array(source);
 }
 
+/** Read the `format` field from a zip's manifest.json without fully parsing the package.
+ * Accepts the already-fetched bytes so the caller doesn't pay for a second fetch. */
+export function peekIphFormat(source: ArrayBuffer | Uint8Array): string | undefined {
+  const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
+  let files: Record<string, Uint8Array>;
+  try { files = unzipSync(bytes); } catch { return undefined; }
+  const manifestBytes = files["manifest.json"];
+  if (!manifestBytes) return undefined;
+  try {
+    const m = JSON.parse(new TextDecoder().decode(manifestBytes)) as { format?: unknown };
+    return typeof m.format === "string" ? m.format : undefined;
+  } catch { return undefined; }
+}
+
 export async function loadIphPackage(source: ArrayBuffer | Response | string): Promise<IphPackage> {
   const bytes = await toBytes(source);
 

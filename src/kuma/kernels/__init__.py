@@ -29,6 +29,7 @@ _KERNEL_NAMES: tuple[str, ...] = (
     "cos.wgsl",
     "sin.wgsl",
     "floor.wgsl",
+    "erf.wgsl",
     # matmul / conv
     "linear.wgsl",
     "bmm.wgsl",

@@ -17,13 +17,13 @@ export function groupNormHandler(ctx: OpContext): void {
   const biasRef = node.args[3] as ArgValue;
   const epsArg = (node.args[4] as number | undefined) ?? 1e-5;
   const input = ctx.resolve(inputRef);
-  if (input.shape.length !== 4) {
+  if (input.shape.length < 3) {
     throw new KumaShapeError(
-      `Op "${node.target}" (node "${node.name}") expects a 4D NCHW input, got shape ${JSON.stringify(input.shape)}.`,
+      `Op "${node.target}" (node "${node.name}") expects an N,C,... input, got shape ${JSON.stringify(input.shape)}.`,
     );
   }
-  const [batch, channels, h, w] = input.shape as [number, number, number, number];
-  const spatial = h * w;
+  const [batch, channels] = input.shape as [number, number, ...number[]];
+  const spatial = numElements(input.shape.slice(2));
   const groups = numGroupsArg;
   const channelsPerGroup = channels / groups;
   const rows = batch * groups;

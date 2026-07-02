@@ -112,8 +112,12 @@ def _build_full_args(ep: torch.export.ExportedProgram, example_inputs: tuple) ->
     user_iter = iter(example_inputs)
 
     args = []
+    constant_tensor_kind = getattr(InputKind, "CONSTANT_TENSOR", None)
+
     for spec in ep.graph_signature.input_specs:
-        if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER):
+        if spec.kind in (InputKind.PARAMETER, InputKind.BUFFER) or (
+            constant_tensor_kind is not None and spec.kind == constant_tensor_kind
+        ):
             tensor = state_dict.get(spec.target, constants.get(spec.target))
             if tensor is None:
                 raise ValueError(f"capture_golden: no value found for weight '{spec.target}'")

@@ -77,6 +77,32 @@
         outline: none;
         border-color: rgba(255,255,255,0.28);
       }
+
+      .mode-toggle {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.2rem;
+        background: #18181c;
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 7px;
+      }
+
+      .mode-toggle button {
+        font: inherit;
+        font-size: 0.78rem;
+        color: rgba(255,255,255,0.48);
+        background: transparent;
+        border: 0;
+        border-radius: 5px;
+        padding: 0.28rem 0.55rem;
+        cursor: pointer;
+      }
+
+      .mode-toggle button[aria-pressed="true"] {
+        color: #fff;
+        background: rgba(255,255,255,0.11);
+      }
     </style>
   </head>
   <body>
@@ -90,9 +116,13 @@
             <option value="">(loading…)</option>
           </select>
         </div>
+        <div class="mode-toggle" aria-label="Player mode">
+          <button id="mode-vanilla" type="button" aria-pressed="true">Player</button>
+          <button id="mode-debug" type="button" aria-pressed="false">Debug</button>
+        </div>
       </header>
 
-      <kuma-player id="player"></kuma-player>
+      <kuma-player id="player" vanilla></kuma-player>
     </div>
 
     <script type="module" src="./main.ts"></script>

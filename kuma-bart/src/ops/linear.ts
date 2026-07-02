@@ -10,7 +10,7 @@ import { numElements } from "../engine/shape.js";
  * Doesn't call ctx.setOutput — callers that chain several of these per node (einsum)
  * only want the *last* result registered, and the caller's own node.meta.shape is the
  * authoritative (possibly >2D) shape to relabel the result with anyway. */
-const LINEAR_TILE = 16;
+const LINEAR_TILE = 64;
 
 export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: ResolvedTensor, bias: ResolvedTensor): ResolvedTensor {
   const k = x.shape[x.shape.length - 1]!;
@@ -19,7 +19,7 @@ export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: Resolv
   const outShape = [m, n];
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([m, k, n]);
-  // linear.wgsl is a 16x16-tiled matmul -- one workgroup per output tile, read directly
+  // linear.wgsl is a 64x64-tiled matmul -- one workgroup per output tile, read directly
   // via workgroup_id, not folded into a linear dispatchElements count (see its header).
   const gridX = Math.ceil(n / LINEAR_TILE);
   const gridY = Math.ceil(m / LINEAR_TILE);
@@ -28,6 +28,15 @@ export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: Resolv
 }
 
 const TRANSPOSE_TARGETS = new Set(["aten.t.default", "aten.transpose.int", "aten.permute.default"]);
+const PASSTHROUGH_TARGETS = new Set([
+  "aten.alias.default",
+  "aten.contiguous.default",
+  "aten.detach.default",
+  "aten.detach_.default",
+  "aten.lift_fresh_copy.default",
+  "aten.to.device",
+  "aten.to.dtype",
+]);
 
 /** Index of the weight-like argument for each matmul target — addmm(bias, x, weight),
  * mm(x, weight). Elision only applies when the transpose node is bound at exactly this
@@ -36,6 +45,7 @@ const TRANSPOSE_TARGETS = new Set(["aten.t.default", "aten.transpose.int", "aten
 const WEIGHT_ARG_INDEX: Record<string, number> = {
   "aten.addmm.default": 2,
   "aten.mm.default": 1,
+  "aten.matmul.default": 1,
 };
 
 function collectNodeRefs(arg: ArgValue, into: Set<string>): void {
@@ -46,6 +56,20 @@ function collectNodeRefs(arg: ArgValue, into: Set<string>): void {
   if (Array.isArray(arg)) {
     for (const a of arg) collectNodeRefs(a, into);
   }
+}
+
+function tracePassthroughSource(nodesByName: ReadonlyMap<string, GraphNode>, ref: string): string {
+  let current = ref;
+  const seen = new Set<string>();
+  while (!seen.has(current)) {
+    seen.add(current);
+    const node = nodesByName.get(current);
+    if (!node || node.op !== "call_function" || !PASSTHROUGH_TARGETS.has(node.target)) break;
+    const next = node.args[0];
+    if (!next || !isNodeRef(next)) break;
+    current = next.node_ref;
+  }
+  return current;
 }
 
 /**
@@ -81,8 +105,9 @@ export function findLinearWeightElisions(nodes: readonly GraphNode[]): Map<strin
     if (n.op !== "call_function" || !TRANSPOSE_TARGETS.has(n.target)) continue;
     const sourceArg = n.args[0];
     if (!sourceArg || !isNodeRef(sourceArg)) continue;
-    const source = nodesByName.get(sourceArg.node_ref);
-    if (!source || source.op !== "placeholder" || source.kind !== "parameter") continue;
+    const sourceRef = tracePassthroughSource(nodesByName, sourceArg.node_ref);
+    const source = nodesByName.get(sourceRef);
+    if (!source || source.op !== "placeholder" || (source.kind !== "parameter" && source.kind !== "buffer")) continue;
 
     const myConsumers = consumers.get(n.name) ?? [];
     if (myConsumers.length !== 1) continue;
@@ -92,6 +117,10 @@ export function findLinearWeightElisions(nodes: readonly GraphNode[]): Map<strin
     const consumerWeightArg = consumer.args[weightIdx];
     if (!consumerWeightArg || !isNodeRef(consumerWeightArg) || consumerWeightArg.node_ref !== n.name) continue;
 
+    // Runtime should alias the transpose's immediate input, not the traced-through
+    // placeholder. The trace above only proves this is ultimately a weight/buffer; the
+    // scheduler's liveness pass may have already released the original placeholder name
+    // after a passthrough chain, while the immediate source remains the live alias.
     elisions.set(n.name, sourceArg.node_ref);
   }
   return elisions;
@@ -107,7 +136,7 @@ export function linearHandler(ctx: OpContext): void {
 
   if (node.target === "aten.addmm.default") {
     [biasRef, xRef, weightRef] = node.args as [ArgValue, ArgValue, ArgValue];
-  } else if (node.target === "aten.mm.default") {
+  } else if (node.target === "aten.mm.default" || node.target === "aten.matmul.default") {
     [xRef, weightRef] = node.args as [ArgValue, ArgValue];
   } else if (node.target === "aten.linear.default") {
     xRef = node.args[0] as ArgValue;

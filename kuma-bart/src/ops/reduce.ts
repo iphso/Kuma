@@ -53,7 +53,10 @@ export function sumHandler(ctx: OpContext): void {
   if (!outShape) {
     throw new KumaShapeError(`Op "${node.target}" (node "${node.name}") is missing an output shape in the manifest.`);
   }
-  ctx.setOutput(buffer, outShape);
+  const imag = input.imag
+    ? dispatchSum(ctx, node.target, node.name, input.imag, input.shape, dimArg).buffer
+    : undefined;
+  ctx.setOutput(buffer, outShape, imag);
 }
 
 /** aten.linalg_vector_norm.default args: (input, ord, dim, keepdim, dtype=None).

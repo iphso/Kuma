@@ -6,6 +6,7 @@ import { runGraph } from "./scheduler.js";
 import { summarize } from "./stats.js";
 import { uploadFloat32 } from "../gpu/buffers.js";
 import { KumaManifestError } from "../errors.js";
+import { findLinearWeightElisions } from "../ops/index.js";
 
 // allclose-style tolerance: |actual - golden| <= ATOL + RTOL * |golden|. Loose enough to
 // absorb ordinary float32 reduction-order differences between a GPU kernel and eager
@@ -57,6 +58,16 @@ export interface BranchVerifyReport {
 export interface VerifyReport {
   ok: boolean;
   branches: BranchVerifyReport[];
+}
+
+function inputShapeFor(manifest: KumaManifest, name: string, length: number): number[] {
+  const placeholder = manifest.graph.nodes.find((n) => n.op === "placeholder" && n.name === name);
+  const shape = placeholder?.meta.shape;
+  if (shape) {
+    const n = shape.reduce((a, b) => a * b, 1);
+    if (n === length) return shape;
+  }
+  return [length];
 }
 
 function compareTensor(node: string, part: "re" | "im", golden: GoldenTensorStats, actualData: Float32Array): NodeDiff | undefined {
@@ -121,11 +132,13 @@ async function verifyBranch(
   const rawInputs = new Map<string, Float32Array>();
   for (const [name, values] of Object.entries(golden.inputs)) {
     const data = new Float32Array(values);
+    const shape = inputShapeFor(manifest, name, data.length);
     rawInputs.set(name, data);
-    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape: [data.length] });
+    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape });
   }
 
-  const captureNodes = new Set(Object.keys(golden.nodes));
+  const ignoredNodes = new Set(findLinearWeightElisions(manifest.graph.nodes).keys());
+  const captureNodes = new Set(Object.keys(golden.nodes).filter((name) => !ignoredNodes.has(name)));
   const outputs = await runGraph({
     device: ctx.device,
     manifest,
@@ -141,12 +154,37 @@ async function verifyBranch(
     captureNodes,
   });
 
+  // Diagnostic: log the first few captured values to help narrow down zeros-in-verify.
+  // The first non-output entry in `outputs` is capturedTensors[0] (earliest golden node
+  // in graph order). If this is already 0.0 for a node that should be non-zero, the
+  // issue is either in dispatch or in readback, not in downstream propagation.
+  if (outputs.length > 1) {
+    const sampleNames = outputs.slice(1, 4).map((o) => o.name);
+    const sampleMeans = outputs.slice(1, 4).map((o) => {
+      if (!o.data.length) return "empty";
+      const sum = Array.from(o.data).reduce((a, b) => a + b, 0);
+      return (sum / o.data.length).toFixed(6);
+    });
+    console.log(
+      `[kuma verify] branch ${branchIndex}: ${outputs.length - 1} captures, ` +
+      `input keys=[${Object.keys(golden.inputs).join(",")}], ` +
+      `first 3 captured nodes: ${sampleNames.map((n, i) => `${n}=mean(${sampleMeans[i]})`).join(", ")}`,
+    );
+  }
+
   const byName = new Map(outputs.map((o) => [o.name, o]));
   const mismatches: NodeDiff[] = [];
   const nodesMissing: string[] = [];
   let nodesChecked = 0;
+  const graphOrder = new Map(manifest.graph.nodes.map((node, i) => [node.name, i]));
+  const goldenEntries = Object.entries(golden.nodes).sort(
+    ([a], [b]) => (graphOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (graphOrder.get(b) ?? Number.MAX_SAFE_INTEGER),
+  );
 
-  for (const [name, stats] of Object.entries(golden.nodes)) {
+  for (const [name, stats] of goldenEntries) {
+    if (ignoredNodes.has(name)) {
+      continue;
+    }
     const actual = byName.get(name);
     if (!actual) {
       nodesMissing.push(name);
@@ -233,8 +271,9 @@ async function warmUpBranch(ctx: VerifyContext, manifest: KumaManifest, golden: 
   const rawInputs = new Map<string, Float32Array>();
   for (const [name, values] of Object.entries(golden.inputs)) {
     const data = new Float32Array(values);
+    const shape = inputShapeFor(manifest, name, data.length);
     rawInputs.set(name, data);
-    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape: [data.length] });
+    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape });
   }
 
   await runGraph({

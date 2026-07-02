@@ -42,7 +42,8 @@ export function expandStrides(inputShape: readonly number[], targetShape: readon
       `can't expand a rank-${inputShape.length} shape down to rank-${targetShape.length}`,
     );
   }
-  const paddedInputShape = new Array(rankPad).fill(1).concat(inputShape);
+  const paddedInputShape = new Array(rankPad).fill(1).concat(inputShape)
+    .map((size, i) => (size === -1 ? targetShape[i]! : size));
   const inputStrides = contiguousStrides(paddedInputShape);
   return targetShape.map((targetSize, d) => {
     const inSize = paddedInputShape[d]!;

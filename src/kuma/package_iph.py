@@ -25,6 +25,9 @@ class Package:
     # a runtime (e.g. kuma-bart) verify it computes the same values, not just NaN-free
     # ones. None when the caller didn't have example inputs to capture it with.
     golden: dict[str, Any] | None = None
+    # Optional model blobs (e.g. ONNX files) written to models/ in the zip. Populated
+    # by the onnx compiler path; empty for standard Kuma/WGSL packages.
+    models: dict[str, bytes] = field(default_factory=dict)
 
     def save(self, out: str | Path) -> Path:
         """Write the self-contained .iph package (a zip archive) to `out`."""
@@ -37,6 +40,8 @@ class Package:
                 zf.writestr(f"kernels/{name}", source)
             for name, source in self.snippets.items():
                 zf.writestr(f"snippets/{name}", source)
+            for name, data in self.models.items():
+                zf.writestr(f"models/{name}", data)
             zf.writestr("debug_report.md", self.debug_report)
             if self.golden is not None:
                 zf.writestr("golden.json", json.dumps(self.golden))
@@ -65,5 +70,11 @@ class Package:
             snippets_dir.mkdir(exist_ok=True)
             for name, source in self.snippets.items():
                 (snippets_dir / name).write_bytes(source)
+
+        if self.models:
+            models_dir = out_dir / "models"
+            models_dir.mkdir(exist_ok=True)
+            for name, data in self.models.items():
+                (models_dir / name).write_bytes(data)
 
         return out_dir

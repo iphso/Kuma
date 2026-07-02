@@ -29,7 +29,14 @@ export function chunkHandler(ctx: OpContext): void {
     const out = ctx.createBuffer(outShape);
     const params = ctx.uniform([outer, inner, dimSize, extent, start, 1, n]);
     ctx.dispatchKernel("slice.wgsl", [input.buffer, out, params], n);
-    ctx.setIndexedOutput(i, { buffer: out, shape: outShape });
+
+    let outImag: GPUBuffer | undefined;
+    if (input.imag) {
+      outImag = ctx.createBuffer(outShape);
+      ctx.dispatchKernel("slice.wgsl", [input.imag, outImag, params], n);
+    }
+
+    ctx.setIndexedOutput(i, { buffer: out, shape: outShape, imag: outImag });
     start += extent;
   }
 }
@@ -67,5 +74,11 @@ export function selectHandler(ctx: OpContext): void {
   ctx.dispatchKernel("slice.wgsl", [input.buffer, out, params], n);
 
   const finalShape = node.meta.shape ?? slicedShape.filter((_, d) => d !== dim);
-  ctx.setOutput(out, finalShape);
+  let outImag: GPUBuffer | undefined;
+  if (input.imag) {
+    outImag = ctx.createBuffer(slicedShape);
+    ctx.dispatchKernel("slice.wgsl", [input.imag, outImag, params], n);
+  }
+
+  ctx.setOutput(out, finalShape, outImag);
 }

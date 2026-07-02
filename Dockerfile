@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
 COPY pyproject.toml .
 COPY src/ src/
 # --no-deps skips torch/numpy (already installed above); pytest comes from [dev]
-RUN pip install --no-cache-dir pytest && \
+RUN pip install --no-cache-dir pytest onnx && \
     pip install --no-cache-dir -e . --no-deps
 
 COPY examples/ examples/

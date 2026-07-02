@@ -33,7 +33,12 @@ export interface KumaMemoryOptions {
    * behavior) forced an allocation + mid-graph-submit storm that made playback visibly
    * chunky, for a steady-state saving (~the pool's own footprint) that isn't worth it once
    * the per-frame leak is fixed. A caller that truly needs the absolute floor can still set
-   * `poolSizeThreshold: 0` explicitly. Individual fields below always win if also set. */
+   * `poolSizeThreshold: 0` explicitly. Individual fields below always win if also set.
+   *
+   * Omit this entirely and `load()` guesses for you via gpu/device.ts's
+   * isLikelyLowMemoryDevice (fallback/software adapter, or a low navigator.deviceMemory
+   * reading) -- best-effort, since WebGPU has no portable free-VRAM query. Pass an
+   * explicit `true`/`false` to skip the guess. */
   lowMemory?: boolean;
   /** Buffer-pool ring depth. Default 2; 1 disables rotation. Also caps how many frames
    * KumaPlayer keeps in flight, since each in-flight frame needs its own live
@@ -46,11 +51,17 @@ export interface KumaMemoryOptions {
   poolSizeThreshold?: number;
 }
 
-function resolveMemoryOptions(options: KumaMemoryOptions = {}): {
+function resolveMemoryOptions(
+  options: KumaMemoryOptions,
+  isLikelyLowMemory: boolean,
+): {
   depth: number;
   sizeThreshold: number;
 } {
-  const depth = options.bufferPoolDepth ?? (options.lowMemory ? 1 : DEFAULT_BUFFER_POOL_DEPTH);
+  // Explicit lowMemory (true or false) always wins; omitted defers to the device-tier
+  // guess from requestKumaDevice() (see gpu/device.ts's isLikelyLowMemoryDevice).
+  const lowMemory = options.lowMemory ?? isLikelyLowMemory;
+  const depth = options.bufferPoolDepth ?? (lowMemory ? 1 : DEFAULT_BUFFER_POOL_DEPTH);
   // lowMemory drops depth (the big lever) but keeps the default pool threshold -- see the
   // KumaMemoryOptions.lowMemory doc for why zeroing it hurt smoothness for little gain.
   const sizeThreshold = options.poolSizeThreshold ?? DEFAULT_POOL_SIZE_THRESHOLD;
@@ -77,7 +88,7 @@ export class KumaModel {
     memory: KumaMemoryOptions = {},
   ): Promise<KumaModel> {
     const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(source);
-    const device = await requestKumaDevice();
+    const { device, isLikelyLowMemory } = await requestKumaDevice();
 
     const weightBuffers = new Map<string, ResolvedTensor>();
     for (const w of manifest.weights) {
@@ -85,7 +96,7 @@ export class KumaModel {
       weightBuffers.set(w.name, { buffer, shape: w.shape });
     }
 
-    const { depth, sizeThreshold } = resolveMemoryOptions(memory);
+    const { depth, sizeThreshold } = resolveMemoryOptions(memory, isLikelyLowMemory);
     return new KumaModel(
       device,
       manifest,
@@ -138,6 +149,19 @@ export class KumaModel {
    * forced into the same hardcoded sweep duration). */
   get playback(): PlaybackMeta | undefined {
     return this.manifest.playback;
+  }
+
+  /** Immediately releases this model's GPU device and everything allocated from it --
+   * weight buffers, pooled/scratch buffers, pipelines -- in one call. Call this when
+   * done with a model (e.g. right before loading a different one into the same player)
+   * instead of just dropping the reference: each `load()` requests its own fresh
+   * GPUDevice (see requestKumaDevice), so an abandoned model's full buffer set
+   * otherwise lingers until JS GC gets around to collecting the whole device graph,
+   * not the instant its owner stops using it. Safe to call more than once (device
+   * destroy() is idempotent); every other method on this instance becomes unusable
+   * afterward since its underlying device is gone. */
+  destroy(): void {
+    this.device.destroy();
   }
 
   private buildInputs(inputs: Record<string, Float32Array>): {

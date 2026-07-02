@@ -9,6 +9,10 @@ import torch
 import torch.export
 
 
+def _is_synthesized_dft_basis(name: str) -> bool:
+    return ".complex_tucker.lifted_tensor_" in name
+
+
 def pack_weights(
     ep: torch.export.ExportedProgram,
 ) -> tuple[bytes, list[dict[str, Any]], list[str]]:
@@ -32,7 +36,7 @@ def pack_weights(
             all_tensors[name] = val
 
     if not all_tensors:
-        return b"", []
+        return b"", [], []
 
     blob = bytearray()
     entries: list[dict[str, Any]] = []
@@ -40,6 +44,9 @@ def pack_weights(
 
     for name in sorted(all_tensors):
         tensor = all_tensors[name]
+
+        if _is_synthesized_dft_basis(name):
+            continue
 
         if tensor.dtype != torch.float32:
             # Non-float32 tensors (e.g. BN's num_batches_tracked: int64) are

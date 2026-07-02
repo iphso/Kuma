@@ -18,6 +18,7 @@ const DEPTHWISE_TILE = 16;
 // (TILE-1)*stride+k halo patch (in floats) its shared-memory buffer can hold
 // (WebGPU's guaranteed-minimum maxComputeWorkgroupStorageSize, 16KB / 4 bytes).
 const DEPTHWISE_PATCH_CAPACITY = 4096;
+const POINTWISE_TILE = 64;
 
 /** in_channels_per_group === 1 (every output channel depends on exactly one input
  * channel, no cross-channel reduction) routes to the halo-tiled depthwise kernel
@@ -65,22 +66,10 @@ function tryDispatchConv2dDepthwise(
   return true;
 }
 
-// Must match conv2d_pointwise.wgsl's MAX_OUT_CHANNELS exactly -- the largest
-// out_channels its per-thread accumulator array can hold without risking register
-// spilling (a too-large per-thread array would be exactly the kind of "added overhead,
-// no offsetting benefit" mistake the weight-cache attempt made).
-const POINTWISE_MAX_OUT_CHANNELS = 64;
-
-/** kh===kw===1 && groups===1 (plain pointwise/channel-mixing conv, the overwhelmingly
- * common case -- grouped pointwise falls back to the general kernel below rather than
- * adding untested complexity for an unverified case) routes to the channel-mixing
- * kernel, *if* out_channels fits its accumulator cap. See conv2d_pointwise.wgsl's
- * header for why this kernel exists (the general kernel's per-output-element dispatch
- * re-reads the same input pixel's channel vector once per output channel; this fixes
- * that via loop reordering + a per-thread accumulator, no shared memory needed since
- * pointwise convs have no spatial overlap between neighboring pixels to cache).
- * Returns false (dispatched nothing) when out_channels doesn't fit, so the caller falls
- * through to the general path. */
+/** kh===kw===1 && groups===1 (plain pointwise/channel-mixing conv) is a GEMM over
+ * rows=(batch, out_h, out_w), cols=out_channels, k=in_channels. conv2d_pointwise.wgsl
+ * executes that GEMM directly against NCHW input/output strides, avoiding the large
+ * NHWC layout buffers that a literal dispatchLinear route would need. */
 function tryDispatchConv2dPointwise(
   ctx: OpContext,
   input: ResolvedTensor,
@@ -102,16 +91,18 @@ function tryDispatchConv2dPointwise(
   padW: number,
   groups: number,
 ): boolean {
-  if (kh !== 1 || kw !== 1 || groups !== 1 || outChannels > POINTWISE_MAX_OUT_CHANNELS) {
+  if (kh !== 1 || kw !== 1 || groups !== 1) {
     return false;
   }
 
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, strideH, strideW, padH, padW]);
-  ctx.dispatchKernel(
+  const rows = batch * outH * outW;
+  ctx.dispatchKernelGrid(
     "conv2d_pointwise.wgsl",
     [input.buffer, weight.buffer, bias.buffer, out, params],
-    batch * outH * outW,
+    Math.ceil(outChannels / POINTWISE_TILE),
+    Math.ceil(rows / POINTWISE_TILE),
   );
   ctx.setOutput(out, outShape);
   return true;
@@ -207,7 +198,7 @@ function dispatchConv2d(
     )
   ) {
     if (CONV2D_DEBUG_ROUTING) {
-      console.log(`[kuma] conv2d "${node.name}" -> conv2d_pointwise.wgsl (in_ch=${inChannels}, out_ch=${outChannels})`);
+      console.log(`[kuma] conv2d "${node.name}" -> conv2d_pointwise.wgsl tiled GEMM (in_ch=${inChannels}, out_ch=${outChannels})`);
     }
     return;
   }

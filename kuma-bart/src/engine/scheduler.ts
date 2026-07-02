@@ -12,6 +12,7 @@ import { opRegistry, findLinearWeightElisions } from "../ops/index.js";
 import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
 import { readBuffers, uploadFloat32 } from "../gpu/buffers.js";
 import { getSnippetFn, type SnippetFn } from "./snippets.js";
+import { synthesizeWeight } from "./synthetic_weights.js";
 
 export interface RunGraphParams {
   device: GPUDevice;
@@ -300,6 +301,12 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
     earlyFreeExclusions.add(t.buffer);
     if (t.imag) earlyFreeExclusions.add(t.imag);
   }
+  // Synthesized weights (see synthetic_weights.ts) live in constantCache, cached across
+  // calls just like real weights -- a one-shot consumer hitting refcount zero must not
+  // trigger the early-free destroy() path for these.
+  for (const buffer of constantCache.values()) {
+    earlyFreeExclusions.add(buffer);
+  }
   // Names whose buffers must survive past this call (model outputs and captured nodes).
   const protectedNames = new Set<string>(params.captureNodes ?? []);
   for (const node of nodes) {
@@ -366,7 +373,8 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   for (const node of nodes) {
     if (node.op === "placeholder") {
       if (node.kind === "parameter" || node.kind === "buffer") {
-        const tensor = weightBuffers.get(node.weight_name!);
+        const tensor = weightBuffers.get(node.weight_name!)
+          ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
         if (!tensor) {
           throw new KumaManifestError(
             `Manifest references weight "${node.weight_name}" with no matching entry in weights[].`,
@@ -555,6 +563,9 @@ export async function runGraph(params: RunGraphParams): Promise<RunGraphOutput[]
   for (const t of weightBuffers.values()) {
     keep.add(t.buffer);
     if (t.imag) keep.add(t.imag);
+  }
+  for (const buffer of constantCache.values()) {
+    keep.add(buffer);
   }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {

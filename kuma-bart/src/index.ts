@@ -1,5 +1,6 @@
 export { KumaModel } from "./model.js";
 export type { KumaMemoryOptions } from "./model.js";
+export { OnnxModel } from "./onnx/model.js";
 export { KumaPlayer } from "./player/KumaPlayer.js";
 export { KumaManifestError, KumaShapeError, KumaUnsupportedOpError } from "./errors.js";
 // Exposed so a caller pipelining multiple in-flight run()/runRaw()/runToGpu() calls

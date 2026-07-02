@@ -1,6 +1,6 @@
 import { defineConfig, type Plugin } from "vite";
-import { readdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 // process.cwd(), not an import.meta.url-relative path: Vite bundles config files
 // through a temporary esbuild step before evaluating them, which can make
@@ -39,10 +39,52 @@ function artifactsApiPlugin(): Plugin {
   };
 }
 
+/** Serves onnxruntime-web's WASM binaries at root-relative URLs (e.g.
+ * /ort-wasm-simd-threaded.jsep.wasm) so the browser can fetch them.  Vite's dev server
+ * doesn't serve node_modules as static files by default, so without this the WASM fetch
+ * returns a 404 HTML page, which WebAssembly.instantiate() then rejects with "expected
+ * magic word 00 61 73 6d".  ort.env.wasm.wasmPaths is set to "/" in OnnxModel (see
+ * src/onnx/model.ts) to steer all WASM fetches here. */
+function onnxWasmPlugin(): Plugin {
+  const wasmDir = join(process.cwd(), "node_modules/onnxruntime-web/dist");
+  return {
+    name: "onnx-wasm",
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        // Strip query string (?import, ?v=... etc.) Vite may append to the URL.
+        const filename = (req.url ?? "").split("?")[0]!.split("/").pop()!;
+        // Only intercept ort's own WASM and JSEP JS files; leave everything else
+        // to Vite's module pipeline.
+        if (filename.startsWith("ort-") && (filename.endsWith(".wasm") || filename.endsWith(".mjs"))) {
+          try {
+            const content = readFileSync(join(wasmDir, filename));
+            const contentType = filename.endsWith(".wasm") ? "application/wasm" : "text/javascript";
+            res.setHeader("Content-Type", contentType);
+            res.end(content);
+            return;
+          } catch {
+            // file not in onnxruntime-web/dist — fall through to Vite's handler
+          }
+        }
+        next();
+      });
+    },
+  };
+}
+
 export default defineConfig({
   // demo/artifacts is bind-mounted from the repo root's artifacts/ by docker-compose's
   // bart-demo service, so it's servable directly at /artifacts/... with no fs.allow
   // overrides needed.
   root: "demo",
-  plugins: [artifactsApiPlugin()],
+  plugins: [artifactsApiPlugin(), onnxWasmPlugin()],
+  optimizeDeps: {
+    // onnxruntime-web must NOT be pre-bundled by Vite's esbuild optimizer.
+    // esbuild runs in Node.js where `typeof navigator === "undefined"` is true, so
+    // it dead-code-eliminates the entire WebGPU branch — leaving only the
+    // `throw new Error("WebGPU is not supported")` path in the output bundle.
+    // Excluding the package means the browser gets ort.mjs as-is and evaluates
+    // the navigator check at runtime, where navigator.gpu is actually available.
+    exclude: ["onnxruntime-web"],
+  },
 });

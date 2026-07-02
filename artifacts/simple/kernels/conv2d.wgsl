@@ -1,5 +1,22 @@
 // aten.convolution.default — direct NCHW conv2d. One invocation per output element.
 // Weight layout: (out_channels, in_channels / groups, kH, kW). Bias is optional (zero-filled when absent).
+//
+// Tried caching the per-(batch,out_channel) weight slice in workgroup-shared memory
+// here (one workgroup per 16x16 output tile) -- measured *slower* on the real target
+// model, not faster. Diagnosis: every conv2d call there has in_channels_per_group*kh*kw
+// of just 9-48 (8 of 13 calls are 1x1 pointwise convs, in_channels_per_group up to 48;
+// the other 5 are depthwise, in_channels_per_group=1, kh/kw up to 7) -- small enough
+// that the GPU's automatic L1/L2 cache almost certainly already served those reads
+// efficiently across threads, for free. The explicit barrier + cooperative shared-memory
+// load added real cost with no corresponding benefit. Reverted to this straightforward
+// version rather than carry that regression.
+//
+// The real redundancy is elsewhere, and differs by conv type: pointwise (1x1) convs are
+// really a per-pixel channel-mixing matmul, where the redundancy is *input* reuse across
+// output channels (not weight reuse); depthwise convs have no cross-channel work at all
+// (in_channels_per_group=1), so the only real lever there is the overlap between
+// neighboring output pixels' receptive fields, which needs halo-aware input tiling.
+// Both are bigger, properly-scoped follow-ups, not a quick re-tune of this kernel.
 
 struct Params {
     batch: u32,
@@ -25,9 +42,12 @@ struct Params {
 @group(0) @binding(4) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
     let total = params.batch * params.out_channels * params.out_h * params.out_w;
-    let idx = gid.x;
+    let idx = gid.x + gid.y * (num_wg.x * 64u);
     if (idx >= total) {
         return;
     }

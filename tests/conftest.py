@@ -16,19 +16,42 @@ def run_pipeline(
     model: nn.Module,
     example_inputs: tuple,
     out_dir: Path,
+    *,
+    backend: str = "torch",
 ) -> dict[str, Any]:
     """
     Run the full compile pipeline against a model and return a dict of all outputs.
     This is the canonical test harness — tests should call this, not reimport internals.
 
+    backend="torch"  — direct torch.export path (default)
+    backend="onnx"   — export via ONNX as an intermediary
+
     Writes both the loose debug artifacts (for assert_artifacts_exist) and a model.iph
     package into out_dir.
     """
     model.eval()
+
+    if backend == "onnx":
+        from kuma.onnx_backend import export_via_onnx
+        package = export_via_onnx(model, example_inputs)
+        package.write_dir(out_dir)
+        iph_path = package.save(out_dir / "model.iph")
+        return {
+            "ep": None,
+            "package": package,
+            "graph_data": package.graph_data,
+            "blob": package.weights_blob,
+            "weight_entries": package.manifest["weights"],
+            "skipped": package.skipped,
+            "manifest": package.manifest,
+            "out_dir": out_dir,
+            "iph_path": iph_path,
+        }
+
     with torch.no_grad():
         ep = torch.export.export(model, example_inputs)
 
-    package: Package = kuma_compile(ep)
+    package = kuma_compile(ep)
     package.write_dir(out_dir)
     iph_path = package.save(out_dir / "model.iph")
 

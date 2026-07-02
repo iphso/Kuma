@@ -12,6 +12,7 @@ import {
   cosHandler,
   sinHandler,
   floorHandler,
+  erfHandler,
   reshapeHandler,
 } from "./elementwise.js";
 import { conv2dHandler, conv2dSimpleHandler } from "./conv2d.js";
@@ -19,7 +20,7 @@ import { linearHandler, findLinearWeightElisions } from "./linear.js";
 import { permuteHandler, transposeHandler } from "./permute.js";
 import { concatHandler } from "./concat.js";
 import { stackHandler } from "./stack.js";
-import { sliceHandler } from "./slice.js";
+import { sliceHandler, sliceMultiHandler } from "./slice.js";
 import { chunkHandler, getitemHandler, selectHandler } from "./chunk.js";
 import { expandHandler } from "./expand.js";
 import { complexHandler, realHandler, imagHandler } from "./complex.js";
@@ -51,6 +52,7 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.cos.default", cosHandler],
   ["aten.sin.default", sinHandler],
   ["aten.floor.default", floorHandler],
+  ["aten.erf.default", erfHandler],
   ["aten.clamp.default", clampHandler],
   ["aten.pow.Tensor_Scalar", powScalarHandler],
   ["aten.rsub.Scalar", rsubScalarHandler],
@@ -58,10 +60,12 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.view.default", reshapeHandler],
   ["aten.reshape.default", reshapeHandler],
   ["aten.permute.default", permuteHandler],
+  ["aten.t.default", transposeHandler],
   ["aten.transpose.int", transposeHandler],
   ["aten.cat.default", concatHandler],
   ["aten.stack.default", stackHandler],
   ["aten.slice.Tensor", sliceHandler],
+  ["aten.slice_multi.default", sliceMultiHandler],
   ["aten.select.int", selectHandler],
   ["aten.chunk.default", chunkHandler],
   ["getitem", getitemHandler],
@@ -70,6 +74,7 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.convolution.default", conv2dHandler],
   ["aten.conv2d.default", conv2dSimpleHandler],
   ["aten.addmm.default", linearHandler],
+  ["aten.matmul.default", linearHandler],
   ["aten.mm.default", linearHandler],
   ["aten.linear.default", linearHandler],
   // normalization
@@ -92,6 +97,9 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   // free / metadata-only passthroughs (see ops/passthrough.ts)
   ["aten.alias.default", passthroughHandler],
   ["aten.contiguous.default", passthroughHandler],
+  ["aten.detach.default", passthroughHandler],
+  ["aten.detach_.default", passthroughHandler],
+  ["aten.lift_fresh_copy.default", passthroughHandler],
   ["aten.to.device", passthroughHandler],
   ["aten.to.dtype", passthroughHandler],
   ["aten.squeeze.dim", passthroughHandler],

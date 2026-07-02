@@ -4,11 +4,13 @@ import { KumaShapeError } from "../errors.js";
 import { permuteMaybeComplex } from "./permute.js";
 import { planEinsum } from "../engine/einsum-plan.js";
 
+const BMM_TILE = 64;
+
 /** bmm.wgsl: a:(B,M,K), b:(B,K,N) -> out:(B,M,N). */
 function dispatchBmm(ctx: OpContext, aBuf: GPUBuffer, bBuf: GPUBuffer, batch: number, m: number, k: number, n: number): GPUBuffer {
   const out = ctx.createBuffer([batch, m, n]);
   const params = ctx.uniform([batch, m, k, n]);
-  ctx.dispatchKernel("bmm.wgsl", [aBuf, bBuf, out, params], batch * m * n);
+  ctx.dispatchKernelGrid("bmm.wgsl", [aBuf, bBuf, out, params], Math.ceil(n / BMM_TILE), Math.ceil(m / BMM_TILE), batch);
   return out;
 }
 

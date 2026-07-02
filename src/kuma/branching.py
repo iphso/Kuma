@@ -95,6 +95,32 @@ def _filter_and_repack_weights(
     return b"".join(parts), out_entries
 
 
+def _collect_node_refs(value: Any, refs: set[str]) -> None:
+    if isinstance(value, dict):
+        node_ref = value.get("node_ref")
+        if isinstance(node_ref, str):
+            refs.add(node_ref)
+        for v in value.values():
+            _collect_node_refs(v, refs)
+    elif isinstance(value, list):
+        for v in value:
+            _collect_node_refs(v, refs)
+
+
+def _prune_unused_placeholders(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    refs: set[str] = set()
+    for node in nodes:
+        if node["op"] == "placeholder":
+            continue
+        _collect_node_refs(node.get("args", []), refs)
+        _collect_node_refs(node.get("kwargs", {}), refs)
+
+    return [
+        node for node in nodes
+        if node["op"] != "placeholder" or node.get("kind") == "user_input" or node["name"] in refs
+    ]
+
+
 def compile_branching(
     router_snippet_name: str,
     router_snippet_source: str,
@@ -197,9 +223,14 @@ def compile_branching(
 
         raw_nodes = graph_data["nodes"]
         fx_output_node = next(n for n in raw_nodes if n["op"] == "output")
-        body_nodes = [n for n in raw_nodes if n["op"] != "output"]
+        pruned_nodes = _prune_unused_placeholders(raw_nodes)
+        body_nodes = [n for n in pruned_nodes if n["op"] != "output"]
 
-        used_weight_names = {n["weight_name"] for n in body_nodes if n["op"] == "placeholder" and "weight_name" in n}
+        packed_weight_names = {entry["name"] for entry in weight_entries}
+        used_weight_names = {
+            n["weight_name"] for n in body_nodes
+            if n["op"] == "placeholder" and n.get("weight_name") in packed_weight_names
+        }
         tight_blob, kept_entries = _filter_and_repack_weights(branch_weights_blob, weight_entries, used_weight_names)
 
         pad = (-running_offset) % 4

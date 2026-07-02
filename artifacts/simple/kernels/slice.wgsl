@@ -1,5 +1,7 @@
 // aten.slice.Tensor — extract [start : start + out_extent * step : step] along one axis.
 // outer = product of dims before the sliced axis, inner = product of dims after it.
+// Also covers aten.select.int (out_extent=1, step=1 — the selected dim is then dropped by
+// a free reshape, since a length-1 axis never affects the contiguous memory layout).
 
 struct Params {
     outer: u32,
@@ -16,8 +18,11 @@ struct Params {
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let idx = gid.x + gid.y * (num_wg.x * 64u);
     if (idx >= params.n) {
         return;
     }

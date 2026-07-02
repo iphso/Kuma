@@ -67,9 +67,11 @@ export function permuteHandler(ctx: OpContext): void {
 }
 
 export function transposeHandler(ctx: OpContext): void {
-  const [inputRef, dim0Arg, dim1Arg] = ctx.node.args as [ArgValue, number, number];
+  const [inputRef, rawDim0Arg, rawDim1Arg] = ctx.node.args as [ArgValue, number | undefined, number | undefined];
   const input = ctx.resolve(inputRef);
   const rank = input.shape.length;
+  const dim0Arg = rawDim0Arg ?? -2;
+  const dim1Arg = rawDim1Arg ?? -1;
   const dim0 = dim0Arg < 0 ? dim0Arg + rank : dim0Arg;
   const dim1 = dim1Arg < 0 ? dim1Arg + rank : dim1Arg;
 

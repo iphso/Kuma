@@ -13,11 +13,11 @@
 - `add` : shape=[1, 3, 32, 32]  dtype=float32
 
 ## ATen Ops Encountered
-| Op | Count | Likely WebGPU-ready |
-|----|------:|:-------------------:|
-| `aten.add.Tensor` | 1 | yes |
-| `aten.convolution.default` | 2 | yes |
-| `aten.gelu.default` | 1 | yes |
+| Op | Count |
+|----|------:|
+| `aten.add.Tensor` | 1 |
+| `aten.convolution.default` | 2 |
+| `aten.gelu.default` | 1 |
 
 ## Weights
 | Name | Shape | Elements | Bytes | Offset |

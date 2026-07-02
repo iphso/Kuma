@@ -2,9 +2,12 @@
  * <kuma-player> — WebGPU model player as a self-contained custom element.
  *
  * Attributes:
- *   src       path to a .iph package; triggers load when changed
- *   debug     (boolean) show debug panel on mount
- *   autoplay  (boolean) start playing immediately after load
+ *   src         path to a .iph package; triggers load when changed
+ *   debug       (boolean) show debug panel on mount
+ *   vanilla     (boolean) hide debug/status UI for a plain video-player surface
+ *   autoplay    (boolean) start playing immediately after load
+ *   low-memory  (boolean) memory-constrained posture: pool depth 1, one frame in flight
+ *   pool-depth  (number) explicit buffer-pool ring depth override
  *
  * CSS custom properties (set on the element or a parent):
  *   --kp-accent    progress bar / accent colour  (default: #ffffff)
@@ -17,6 +20,8 @@
 
 import { KumaModel, BUFFER_POOL_DEPTH } from "../index.js";
 import type { VerifyReport, ProfileReport } from "../index.js";
+import { OnnxModel } from "../onnx/model.js";
+import { peekIphFormat } from "../iph/loader.js";
 import { GpuFrameRenderer } from "./gpuRender.js";
 
 // ── Icons ──────────────────────────────────────────────────────────────────────
@@ -207,6 +212,12 @@ canvas {
 }
 .kp-debug.hidden { display: none; }
 
+:host([vanilla]) .kp-status,
+:host([vanilla]) .kp-debug-btn,
+:host([vanilla]) .kp-debug {
+  display: none;
+}
+
 .kp-debug-row {
   display: flex;
   gap: 8px;
@@ -319,7 +330,7 @@ const PROFILE_WARMUP_RUNS = 5;
 // ── KumaPlayer ─────────────────────────────────────────────────────────────────
 
 export class KumaPlayer extends HTMLElement {
-  static readonly observedAttributes = ["src", "debug", "autoplay", "low-memory", "pool-depth"];
+  static readonly observedAttributes = ["src", "debug", "vanilla", "autoplay", "low-memory", "pool-depth"];
 
   private readonly shadow: ShadowRoot;
 
@@ -339,6 +350,7 @@ export class KumaPlayer extends HTMLElement {
 
   // Playback state
   private model: KumaModel | undefined;
+  private onnxModel: OnnxModel | undefined;
   private gpuRenderer: GpuFrameRenderer | undefined;
   private timeInputName: string | undefined;
   private inFlight = 0;
@@ -346,6 +358,11 @@ export class KumaPlayer extends HTMLElement {
   private playing = false;
   private loadPending = false;  // true when play was clicked before model loaded
   private loadInProgress = false;
+  private hasConnectedBefore = false;
+  // Bumped at the start of every load() -- lets a superseded in-flight load() or
+  // submitFrame() callback (from a model the user has since switched away from) detect
+  // it's stale and bail out instead of touching the newer model's state.
+  private loadGeneration = 0;
   private playStartMs = 0;
   private capacityHits = 0;
   private requestedFrames = 0;
@@ -394,23 +411,39 @@ export class KumaPlayer extends HTMLElement {
 
   connectedCallback(): void {
     if (this.hasAttribute("debug")) this.setDebugVisible(true);
+    this.syncMode();
     const src = this.getAttribute("src");
     if (src) this.maybeLoad(src);
+    this.hasConnectedBefore = true;
   }
 
   attributeChangedCallback(name: string, oldVal: string | null, newVal: string | null): void {
     if (!this.isConnected) return;
     if (name === "src" && newVal !== null && newVal !== oldVal) {
-      this.maybeLoad(newVal);
+      if (this.hasConnectedBefore) {
+        // A `src` change after the element has already connected once can only come from
+        // explicit imperative code (e.g. a model picker) -- necessarily a deliberate
+        // selection, not static markup -- so load immediately. The "wait for a play
+        // click" lazy gate (see maybeLoad) applies only to a `src` already present when
+        // the element first connects (custom-element upgrade always runs
+        // attributeChangedCallback for pre-existing attributes *before*
+        // connectedCallback, so hasConnectedBefore is still false at that point --
+        // connectedCallback's own maybeLoad(src) call handles that case instead).
+        void this.load(newVal).catch((err: unknown) => this.logError("Load error", err));
+      }
     }
     if (name === "debug") {
       this.setDebugVisible(newVal !== null);
+    }
+    if (name === "vanilla") {
+      this.syncMode();
     }
   }
 
   /** Load immediately if autoplay is set; otherwise arm the play button so the
    * first click loads-then-plays (avoids uploading all models' weights to VRAM
-   * simultaneously on pages with multiple players). */
+   * simultaneously on pages with multiple players declared upfront in markup). Only
+   * used for a `src` already present at initial connect -- see attributeChangedCallback. */
   private maybeLoad(src: string): void {
     if (this.hasAttribute("autoplay")) {
       void this.load(src).catch((err: unknown) => this.logError("Load error", err));
@@ -423,37 +456,112 @@ export class KumaPlayer extends HTMLElement {
   // ── Public API ──────────────────────────────────────────────────────────────
 
   async load(src: string): Promise<void> {
+    const myGeneration = ++this.loadGeneration;
     this.loadInProgress = true;
     this.stopPlayback();
+    // Eagerly release the previous model's GPU/session resources instead of just
+    // dropping the reference -- WebGPU buffers/pipelines and ORT sessions otherwise
+    // linger until GC gets around to the whole object graph, which is exactly the kind
+    // of per-frame-scale leak this player's memory work has been about avoiding. Fire-
+    // and-forget: nothing below depends on either completing, and this model is already
+    // unreachable from any future render.
+    this.model?.destroy();
+    if (this.onnxModel) void this.onnxModel.destroy().catch((err: unknown) => console.error("[kuma-player] session release error", err));
+    this.model = undefined;
+    this.onnxModel = undefined;
+    this.gpuRenderer = undefined;
+    // Abandon any frames still in flight for the previous model -- submitFrame's own
+    // completion callbacks check loadGeneration and will no-op now that it's stale, so
+    // this counter is safe to reset out from under them rather than waiting them out.
+    this.inFlight = 0;
+    this.pendingT = undefined;
     this.setControlsEnabled(false);
-    this.canvas.style.display = "none";
+    this.resetCanvas();
     this.placeholderEl.textContent = "Loading…";
     this.placeholderEl.style.display = "";
     this.statusEl.textContent = "";
     this.logEl.textContent = `loading ${src}…`;
 
-    // `low-memory` attribute → memory-constrained posture (pool depth 1 = one frame in
-    // flight, the dominant peak-memory lever; small buffers still pooled). For Chromebooks
-    // / integrated GPUs where VRAM is shared system RAM. `pool-depth="N"` overrides the
-    // depth explicitly (and thus how many frames the player pipelines, since maxInFlight
-    // follows pool depth) -- raise it on devices with memory headroom for smoother
-    // playback; each extra depth is ~one more in-flight frame's worth of activations.
-    const lowMemory = this.hasAttribute("low-memory");
-    const depthAttr = Number(this.getAttribute("pool-depth"));
-    const bufferPoolDepth = Number.isInteger(depthAttr) && depthAttr > 0 ? depthAttr : undefined;
-    this.model = await KumaModel.load(src, { lowMemory, bufferPoolDepth });
-    if (bufferPoolDepth !== undefined) this.log(`pool depth ${bufferPoolDepth}: up to ${bufferPoolDepth} frame(s) in flight`);
-    else if (lowMemory) this.log("low-memory mode: pool depth 1, 1 frame in flight (small buffers pooled)");
-    this.gpuRenderer = new GpuFrameRenderer(this.model.gpuDevice, this.canvas);
-    this.log(`inputs: ${JSON.stringify(this.model.inputs)}`);
-    this.log(`outputs: ${JSON.stringify(this.model.outputs)}`);
+    // Fetch once so we can peek the format before dispatching to the right model class.
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`Failed to fetch "${src}": ${res.status} ${res.statusText}`);
+    const bytes = await res.arrayBuffer();
+    if (myGeneration !== this.loadGeneration) return; // superseded by a newer load() while fetching
+    const format = peekIphFormat(bytes);
+    const isOnnx = format === "onnx" || format === "onnx-branching";
 
-    const durationSeconds = this.model.playback?.duration_seconds;
+    let inputs: ReadonlyArray<{ name: string; shape?: number[] }>;
+    let outputs: ReadonlyArray<{ name: string; shape?: number[] }>;
+    let durationSeconds: number | undefined;
+
+    if (isOnnx) {
+      const onnxModel = await OnnxModel.load(bytes, { executionProviders: ["webgpu"] });
+      if (myGeneration !== this.loadGeneration) {
+        // Superseded while loading -- this model never got wired into `this`, so nothing
+        // else can reach it; release it directly instead of leaking its sessions.
+        void onnxModel.destroy().catch((err: unknown) => console.error("[kuma-player] session release error", err));
+        return;
+      }
+      this.onnxModel = onnxModel;
+      inputs = onnxModel.inputs;
+      outputs = onnxModel.outputs;
+      durationSeconds = onnxModel.playback?.duration_seconds;
+      this.log(`format: ${format}`);
+      this.log(`inputs: ${JSON.stringify(inputs)}`);
+      this.log(`outputs: ${JSON.stringify(outputs)}`);
+      this.log("compiling shaders…");
+      const t0onnx = performance.now();
+      await onnxModel.warmAll((done, total) => {
+        this.log(`  segment ${done}/${total} compiled`);
+      });
+      if (myGeneration !== this.loadGeneration) {
+        void onnxModel.destroy().catch((err: unknown) => console.error("[kuma-player] session release error", err));
+        return;
+      }
+      this.log(`shader compilation done in ${(performance.now() - t0onnx).toFixed(0)}ms.`);
+    } else {
+      // `low-memory` attribute → memory-constrained posture (pool depth 1 = one frame in
+      // flight, the dominant peak-memory lever; small buffers still pooled). For Chromebooks
+      // / integrated GPUs where VRAM is shared system RAM. `pool-depth="N"` overrides the
+      // depth explicitly (and thus how many frames the player pipelines, since maxInFlight
+      // follows pool depth) -- raise it on devices with memory headroom for smoother
+      // playback; each extra depth is ~one more in-flight frame's worth of activations.
+      const lowMemory = this.hasAttribute("low-memory");
+      const depthAttr = Number(this.getAttribute("pool-depth"));
+      const bufferPoolDepth = Number.isInteger(depthAttr) && depthAttr > 0 ? depthAttr : undefined;
+      const model = await KumaModel.load(bytes, { lowMemory, bufferPoolDepth });
+      if (myGeneration !== this.loadGeneration) {
+        // Superseded while loading -- never wired into `this`, so safe (and necessary,
+        // to avoid leaking its device/buffers) to destroy directly.
+        model.destroy();
+        return;
+      }
+      this.model = model;
+      if (bufferPoolDepth !== undefined) this.log(`pool depth ${bufferPoolDepth}: up to ${bufferPoolDepth} frame(s) in flight`);
+      else if (lowMemory) this.log("low-memory mode: pool depth 1, 1 frame in flight (small buffers pooled)");
+      this.gpuRenderer = new GpuFrameRenderer(model.gpuDevice, this.canvas);
+      inputs = model.inputs;
+      outputs = model.outputs;
+      durationSeconds = model.playback?.duration_seconds;
+      this.log(`inputs: ${JSON.stringify(inputs)}`);
+      this.log(`outputs: ${JSON.stringify(outputs)}`);
+
+      this.log("warming up…");
+      const t0 = performance.now();
+      await model.warmUp();
+      if (myGeneration !== this.loadGeneration) {
+        model.destroy();
+        return;
+      }
+      this.log(`warm-up done in ${(performance.now() - t0).toFixed(0)}ms.`);
+    }
+
     if (durationSeconds !== undefined) {
       this.playSweepMs = durationSeconds * 1000;
+      const playback = isOnnx ? this.onnxModel!.playback : this.model!.playback;
       this.log(
         `playback: ${durationSeconds}s/sweep` +
-          (this.model.playback?.fps !== undefined ? ` @ ${this.model.playback.fps}fps` : "") +
+          (playback?.fps !== undefined ? ` @ ${playback.fps}fps` : "") +
           ` (from .iph metadata)`,
       );
     } else {
@@ -461,21 +569,17 @@ export class KumaPlayer extends HTMLElement {
       this.log(`playback: no duration_seconds — using ${(DEFAULT_PLAY_SWEEP_MS / 1000).toFixed(1)}s default.`);
     }
 
-    this.log("warming up…");
-    const t0 = performance.now();
-    await this.model.warmUp();
-    this.log(`warm-up done in ${(performance.now() - t0).toFixed(0)}ms.`);
-
-    const inputSpec = this.model.inputs[0]!;
-    const n = (inputSpec.shape ?? []).reduce((a, b) => a * b, 1);
+    // shape is often absent for ONNX manifests; default to [1] (scalar time input).
+    const inputSpec = inputs[0]!;
+    const n = (inputSpec.shape ?? [1]).reduce((a, b) => a * b, 1);
     const isScalar = n === 1;
     this.timeInputName = isScalar ? inputSpec.name : undefined;
 
-    this.verifyBtn.disabled = false;
+    if (!isOnnx) this.verifyBtn.disabled = false;
     if (isScalar) {
       this.scrubber.disabled = false;
       this.playBtn.disabled = false;
-      this.profileBtn.disabled = false;
+      if (!isOnnx) this.profileBtn.disabled = false;
       this.log(`scrubbing "${inputSpec.name}" over t ∈ [0, 1].`);
       this.submitFrame(Number(this.scrubber.value));
     } else {
@@ -493,6 +597,43 @@ export class KumaPlayer extends HTMLElement {
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
+
+  /** Replace the canvas element so the next load always starts with a fresh context.
+   * A canvas can only have one context type (webgpu vs 2d) for its lifetime, so we
+   * must swap it out before switching between KumaModel (WebGPU) and OnnxModel (2D). */
+  private resetCanvas(): void {
+    const fresh = document.createElement("canvas");
+    fresh.className = "kp-canvas";
+    fresh.style.display = "none";
+    this.canvas.replaceWith(fresh);
+    this.canvas = fresh;
+  }
+
+  /** Render a CHW/NCHW Float32Array output to the canvas via the 2D API. */
+  private renderCpuFrame(data: Float32Array, shape: readonly number[]): boolean {
+    const dims = shape.length === 4 ? shape.slice(1) : [...shape];
+    if (dims.length !== 3) return false;
+    const [channels, height, width] = dims as [number, number, number];
+    if (channels !== 1 && channels !== 3) return false;
+    const ctx = this.canvas.getContext("2d");
+    if (!ctx) return false;
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+    }
+    const imageData = ctx.createImageData(width, height);
+    const plane = width * height;
+    const px = imageData.data;
+    for (let i = 0; i < plane; i++) {
+      const r = Math.round(Math.max(0, Math.min(1, data[i]!)) * 255);
+      px[i * 4]     = r;
+      px[i * 4 + 1] = channels >= 2 ? Math.round(Math.max(0, Math.min(1, data[plane + i]!)) * 255) : r;
+      px[i * 4 + 2] = channels >= 3 ? Math.round(Math.max(0, Math.min(1, data[2 * plane + i]!)) * 255) : r;
+      px[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(imageData, 0, 0);
+    return true;
+  }
 
   private log(line: string): void {
     this.logEl.textContent += `\n${line}`;
@@ -521,10 +662,24 @@ export class KumaPlayer extends HTMLElement {
     this.timeEl.textContent = t.toFixed(3);
   }
 
+  private formatFps(elapsedMs: number): string {
+    if (elapsedMs <= 0) return "∞fps";
+    return `${(1000 / elapsedMs).toFixed(1)}fps`;
+  }
+
   private setDebugVisible(show: boolean): void {
+    if (show && this.hasAttribute("vanilla")) show = false;
     this.debugVisible = show;
     this.debugPanel.classList.toggle("hidden", !show);
     this.debugBtn.classList.toggle("active", show);
+  }
+
+  private syncMode(): void {
+    if (this.hasAttribute("vanilla")) {
+      this.setDebugVisible(false);
+    } else if (this.hasAttribute("debug")) {
+      this.setDebugVisible(true);
+    }
   }
 
   private togglePlay(): void {
@@ -573,11 +728,19 @@ export class KumaPlayer extends HTMLElement {
 
   /** Submit a frame render at time `t` — latest-wins under the in-flight cap. */
   private submitFrame(t: number): void {
-    const m = this.model;
     const name = this.timeInputName;
-    if (!m || !name) return;
+    if (!name) return;
+
+    // Captured now so this call's own completion callbacks can tell, once they finally
+    // resolve, whether the user has since switched to a different model (load() bumps
+    // this) -- if so, this.model/this.onnxModel/this.inFlight/etc. already belong to
+    // that newer model, and this frame's stale result must not touch any of it.
+    const generation = this.loadGeneration;
     this.requestedFrames++;
-    if (this.inFlight >= this.maxInFlight) {
+    // ONNX InferenceSession.run() is not concurrent-safe on the same session —
+    // limit to 1 in-flight for ONNX, use the loaded KumaModel's real pool depth otherwise.
+    const maxInFlight = this.onnxModel ? 1 : this.maxInFlight;
+    if (this.inFlight >= maxInFlight) {
       this.capacityHits++;
       this.pendingT = t;
       return;
@@ -588,10 +751,57 @@ export class KumaPlayer extends HTMLElement {
     const input = new Float32Array([t]);
     const t0 = performance.now();
 
+    const drain = () => {
+      // The previous model's inFlight/pendingT counters no longer apply once a newer
+      // load() has reset them for its own model -- decrementing or pulling a pending
+      // frame here would corrupt the new model's bookkeeping instead of this stale one's.
+      if (generation !== this.loadGeneration) return;
+      this.inFlight--;
+      if (this.pendingT !== undefined) {
+        const next = this.pendingT;
+        this.pendingT = undefined;
+        this.submitFrame(next);
+      }
+    };
+
+    if (this.onnxModel) {
+      // ONNX path: inference → 2D canvas rendering.
+      const om = this.onnxModel;
+      const outSpec = om.outputs[0];
+      void om
+        .run({ [name]: input })
+        .then((outputs) => {
+          if (generation !== this.loadGeneration) return; // model switched away from mid-run; discard
+          if (seq > this.latestRenderedSequence) {
+            this.latestRenderedSequence = seq;
+            const outName = outSpec?.name ?? Object.keys(outputs)[0]!;
+            const result = outputs[outName];
+            // shape comes from the real ort tensor dims, not the manifest
+            if (result) this.renderCpuFrame(result.data, result.shape);
+            const elapsed = performance.now() - t0;
+            this.statusEl.textContent =
+              `t=${t.toFixed(3)}  ${this.formatFps(elapsed)}  "${outName}"  ${JSON.stringify(result?.shape ?? "?")}`;
+          }
+        })
+        .catch((err: unknown) => {
+          // A stale generation's session may have been release()d out from under this
+          // call by a newer load() -- that's an expected rejection, not a real error.
+          if (generation !== this.loadGeneration) return;
+          this.logError(`Error at t=${t.toFixed(3)}`, err);
+          this.stopPlayback();
+        })
+        .finally(drain);
+      return;
+    }
+
+    // KumaModel (WebGPU) path.
+    const m = this.model;
+    if (!m) { drain(); return; }
     void m
       .runToGpu({ [name]: input })
       .then(async (outputs) => {
-        if (seq > this.latestRenderedSequence) {
+        const current = generation === this.loadGeneration;
+        if (current && seq > this.latestRenderedSequence) {
           this.latestRenderedSequence = seq;
           for (const out of outputs) this.gpuRenderer?.render(out.buffer, out.shape);
           const elapsed = performance.now() - t0;
@@ -600,29 +810,29 @@ export class KumaPlayer extends HTMLElement {
           }
           if (outputs[0]) {
             this.statusEl.textContent =
-              `t=${t.toFixed(3)}  ${elapsed.toFixed(1)}ms enqueue  ` +
+              `t=${t.toFixed(3)}  ${this.formatFps(elapsed)} enqueue  ` +
               `"${outputs[0].name}"  ${JSON.stringify(outputs[0].shape)}`;
           }
+          // Only worth waiting for real completion (for the stall-spike measurement
+          // above) when this is still the live model -- a stale model's device may
+          // already be destroy()d by a newer load(), which would reject this wait.
+          await m.gpuDevice.queue.onSubmittedWorkDone();
         }
-        await m.gpuDevice.queue.onSubmittedWorkDone();
         // Output buffers are large (≥ frame size), bypass the pool, and are never
         // destroyed by the scheduler -- caller owns them. Destroy explicitly now that
         // both the compute pass that wrote them and the render pass that read them
-        // are confirmed done.
+        // are confirmed done (or, if stale, right away -- destroy() on a buffer whose
+        // device is already gone is a safe no-op).
         for (const out of outputs) out.buffer.destroy();
       })
       .catch((err: unknown) => {
+        // A stale generation's device may have been destroy()d out from under this call
+        // by a newer load() -- that's an expected rejection, not a real error.
+        if (generation !== this.loadGeneration) return;
         this.logError(`Error at t=${t.toFixed(3)}`, err);
         this.stopPlayback();
       })
-      .finally(() => {
-        this.inFlight--;
-        if (this.pendingT !== undefined) {
-          const next = this.pendingT;
-          this.pendingT = undefined;
-          this.submitFrame(next);
-        }
-      });
+      .finally(drain);
   }
 
   private playTick(nowMs: number): void {

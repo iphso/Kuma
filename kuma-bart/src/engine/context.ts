@@ -34,17 +34,20 @@ export interface ResolvedTensor {
  * Pooling only the small ones (<1 MB) reduces steady-state to ~30 MB while preserving
  * the GC-pause fix for the ~210 small/medium buffers it was actually needed for.
  *
- * Depth 2 (down from 3): saves 33% of steady-state pool VRAM and one in-flight frame
- * slot. On memory-constrained devices (Chromebooks, integrated-GPU laptops) that can't
- * sustain 60fps anyway, the extra pipelining slot was not providing measurable throughput
- * benefit. KumaPlayer's MAX_IN_FLIGHT derives from this directly.
+ * Depth 3: full pipelining for the common case (discrete/desktop GPUs), where the extra
+ * in-flight slot noticeably smooths playback over depth 2 -- dropping to 2 traded away
+ * that smoothness for a VRAM saving most devices don't need. Memory-constrained devices
+ * (Chromebooks, integrated-GPU laptops) still want fewer in-flight frames; rather than
+ * lowering the shared default, model.ts's device-tier heuristic (see
+ * gpu/device.ts's isLikelyLowMemoryDevice) auto-selects a lower depth for those devices
+ * specifically, so the common case doesn't pay for the constrained case's trade-off.
  *
  * This is only the *default*; a per-model override travels on BufferPoolState.depth (see
  * createBufferPoolState / KumaModel.load's memory options). Depth 1 disables rotation
  * entirely -- every call reuses the one slot, which acquireGenerationSlot serializes
  * against the GPU's completion signal, collapsing peak pool VRAM to a single generation's
  * worth at the cost of throughput. That's the right trade on a Chromebook. */
-export const DEFAULT_BUFFER_POOL_DEPTH = 2;
+export const DEFAULT_BUFFER_POOL_DEPTH = 3;
 
 /** Back-compat re-export of the default depth. KumaPlayer derives a *cold-start* in-flight
  * cap from this for the window before a model has actually loaded; once one has, it reads
@@ -274,14 +277,12 @@ export class OpContext {
   }
 
   /** Pack u32 fields (WGSL struct order) into a ready-to-bind uniform buffer. Cached
-   * forever once built: every field here comes from graph structure (shape, stride,
-   * weight dims, etc. -- see node.meta/args), never from actual input data, so the
-   * exact same buffer is correct on every subsequent call for this node -- rebuilding
-   * it every frame is pure waste, not extra correctness. Safe to cache indefinitely:
-   * never written to again after creation, so there's no multi-frame-in-flight reuse
-   * hazard the way pooled *output* buffers have. */
+   * by value: most fields come from graph structure, but ONNX exports can have concrete
+   * batch-dependent shapes that differ between playback and golden verification for the
+   * same node. The values still are not data-dependent, so caching identical param
+   * payloads remains useful; the payload itself must be part of the key. */
   uniform(fields: readonly number[]): GPUBuffer {
-    const key = `params:${this.node.name}:${this.uniformCallIndex++}`;
+    const key = `params:${this.node.name}:${this.uniformCallIndex++}:${fields.join(",")}`;
     let buffer = this.constantCache.get(key);
     if (!buffer) {
       buffer = createUniformBuffer(this.device, packParams(fields));
@@ -291,9 +292,9 @@ export class OpContext {
   }
 
   /** Like `uniform`, for Params structs that mix u32 and f32 fields (e.g. clamp,
-   * group_norm/layer_norm's eps). Same caching rationale as `uniform`. */
+   * group_norm/layer_norm's eps). Same value-keyed caching rationale as `uniform`. */
   uniformTyped(fields: readonly TypedParamField[]): GPUBuffer {
-    const key = `params:${this.node.name}:${this.uniformCallIndex++}`;
+    const key = `params:${this.node.name}:${this.uniformCallIndex++}:${JSON.stringify(fields)}`;
     let buffer = this.constantCache.get(key);
     if (!buffer) {
       buffer = createUniformBuffer(this.device, packTypedParams(fields));

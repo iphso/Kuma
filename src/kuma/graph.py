@@ -84,10 +84,12 @@ def serialize_graph(ep: torch.export.ExportedProgram) -> dict[str, Any]:
     """Build the exported_graph JSON structure from an ExportedProgram."""
     sig = ep.graph_signature
 
-    # node_name → state_dict key for parameter and buffer placeholders
+    # node_name → state_dict/constants key for lifted tensor placeholders
     param_node_map: dict[str, str] = {}
     buffer_node_map: dict[str, str] = {}
+    constant_node_map: dict[str, str] = {}
     user_input_nodes: set[str] = set()
+    constant_tensor_kind = getattr(InputKind, "CONSTANT_TENSOR", None)
 
     for spec in sig.input_specs:
         name = spec.arg.name
@@ -95,6 +97,8 @@ def serialize_graph(ep: torch.export.ExportedProgram) -> dict[str, Any]:
             param_node_map[name] = spec.target
         elif spec.kind == InputKind.BUFFER:
             buffer_node_map[name] = spec.target
+        elif constant_tensor_kind is not None and spec.kind == constant_tensor_kind:
+            constant_node_map[name] = spec.target
         elif spec.kind == InputKind.USER_INPUT:
             user_input_nodes.add(name)
 
@@ -117,6 +121,11 @@ def serialize_graph(ep: torch.export.ExportedProgram) -> dict[str, Any]:
             elif node.name in buffer_node_map:
                 entry["kind"] = "buffer"
                 entry["weight_name"] = buffer_node_map[node.name]
+            elif node.name in constant_node_map:
+                # Runtime treats non-user placeholders as weight-backed when their
+                # kind is parameter/buffer. Lifted constants use the same storage path.
+                entry["kind"] = "buffer"
+                entry["weight_name"] = constant_node_map[node.name]
             else:
                 entry["kind"] = "user_input"
 

@@ -171,6 +171,7 @@ export const sqrtHandler = unaryElementwise("sqrt.wgsl");
 export const cosHandler = unaryElementwise("cos.wgsl");
 export const sinHandler = unaryElementwise("sin.wgsl");
 export const floorHandler = unaryElementwise("floor.wgsl");
+export const erfHandler = unaryElementwise("erf.wgsl");
 export const reshapeHandler = unaryElementwise("reshape.wgsl");
 
 /** aten.div.Tensor_mode args: (a, b, rounding_mode). Only "floor" is supported (the

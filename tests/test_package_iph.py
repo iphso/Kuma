@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 import kuma
+from kuma.kernels import _KERNEL_NAMES
 
 
 class _Simple(nn.Module):
@@ -24,10 +25,7 @@ class _Simple(nn.Module):
 
 _EXAMPLE_INPUT = (torch.randn(1, 3, 32, 32),)
 
-_REQUIRED_KERNELS = {
-    "add.wgsl", "mul.wgsl", "gelu.wgsl", "relu.wgsl", "conv2d.wgsl",
-    "linear.wgsl", "reshape.wgsl", "permute.wgsl", "concat.wgsl", "slice.wgsl",
-}
+_REQUIRED_KERNELS = set(_KERNEL_NAMES)
 
 
 def _zip_names(path) -> set[str]:

@@ -78,9 +78,19 @@ def export_model(
     example_inputs: tuple,
     out: str | Path,
     *,
+    backend: str = "torch",
     fps: float | None = None,
     duration_seconds: float | None = None,
 ) -> Path:
-    """Run torch.export.export on `model` and save the result as a .iph package."""
+    """Run torch.export.export on `model` and save the result as a .iph package.
+
+    backend="torch"  — direct torch.export path (default, existing behaviour)
+    backend="onnx"   — export via ONNX as an intermediary (requires onnx package)
+    """
+    if backend == "onnx":
+        from kuma.onnx_backend import export_via_onnx
+        return export_via_onnx(
+            model, example_inputs, fps=fps, duration_seconds=duration_seconds
+        ).save(out)
     ep = export_program(model, example_inputs)
     return export_exported_program(ep, out, example_inputs, fps=fps, duration_seconds=duration_seconds)

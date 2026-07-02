@@ -6,6 +6,7 @@ import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
 import { readBuffers } from "../gpu/buffers.js";
 import type { SnippetFn } from "./snippets.js";
 import { resolveSwitches, type RunGraphParams } from "./scheduler.js";
+import { synthesizeWeight } from "./synthetic_weights.js";
 
 export interface OpTiming {
   name: string;
@@ -96,7 +97,8 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   for (const node of nodes) {
     if (node.op === "placeholder") {
       if (node.kind === "parameter" || node.kind === "buffer") {
-        const tensor = weightBuffers.get(node.weight_name!);
+        const tensor = weightBuffers.get(node.weight_name!)
+          ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
         if (!tensor) {
           throw new KumaManifestError(`Manifest references weight "${node.weight_name}" with no matching entry in weights[].`);
         }
@@ -186,6 +188,9 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   for (const t of weightBuffers.values()) {
     keep.add(t.buffer);
     if (t.imag) keep.add(t.imag);
+  }
+  for (const buffer of constantCache.values()) {
+    keep.add(buffer);
   }
   for (const slots of bufferPool.pools.values()) {
     for (const buffer of slots) {
