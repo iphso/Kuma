@@ -89,10 +89,41 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   const elisions = findLinearWeightElisions(nodes);
   const resolved = new Map<string, ResolvedTensor>(seeded);
 
-  // Pass 1: resolve placeholders/elided aliases (no GPU work) and collect the nodes that
-  // will actually dispatch a kernel, so the query set can be sized exactly upfront.
+  // Pass 1: just count the nodes that will actually dispatch a kernel, so the query
+  // set can be sized exactly upfront. Deliberately doesn't resolve anything -- an
+  // elided transpose's alias target (see ops/linear.ts's findLinearWeightElisions)
+  // is its *immediate* input, which may itself be a genuine dispatch node (e.g. a
+  // detach_ passthrough between the weight and the transpose), not a placeholder.
+  // Resolving eagerly here, before that dependency has actually run, threw "elided
+  // transpose aliases ... before it was resolved". Resolution happens in pass 2
+  // below instead, interleaved with dispatch in node order -- same structure as
+  // scheduler.ts's runGraph -- so any alias target is guaranteed already resolved
+  // by the time it's needed.
+  let dispatchCount = 0;
+  for (const node of nodes) {
+    if (node.op === "placeholder" || node.op === "output" || elisions.has(node.name)) continue;
+    if (!opRegistry.get(node.target)) {
+      throw new KumaUnsupportedOpError(node.target, node.name);
+    }
+    dispatchCount++;
+  }
+
+  const querySet = device.createQuerySet({ type: "timestamp", count: dispatchCount * 2 });
+  const queryBuffer = device.createBuffer({
+    size: dispatchCount * 2 * 8,
+    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+  });
+
+  const encoder = device.createCommandEncoder();
+  // See scheduler.ts / OpContext: fresh non-pooled buffers (incl. op-internal
+  // intermediates never in `resolved`) are collected here so cleanup can free them.
+  const transientBuffers = new Set<GPUBuffer>();
+
+  // Pass 2: single interleaved walk resolving placeholders/elided aliases inline and
+  // dispatching a timestamped GPU pass for every other node.
   const dispatchNodes: GraphNode[] = [];
   let outputNode: GraphNode | undefined;
+  let dispatchIndex = 0;
 
   for (const node of nodes) {
     if (node.op === "placeholder") {
@@ -125,28 +156,10 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
       resolved.set(node.name, tensor);
       continue;
     }
-    if (!opRegistry.get(node.target)) {
-      throw new KumaUnsupportedOpError(node.target, node.name);
-    }
-    dispatchNodes.push(node);
-  }
 
-  const querySet = device.createQuerySet({ type: "timestamp", count: dispatchNodes.length * 2 });
-  const queryBuffer = device.createBuffer({
-    size: dispatchNodes.length * 2 * 8,
-    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-  });
-
-  const encoder = device.createCommandEncoder();
-  // See scheduler.ts / OpContext: fresh non-pooled buffers (incl. op-internal
-  // intermediates never in `resolved`) are collected here so cleanup can free them.
-  const transientBuffers = new Set<GPUBuffer>();
-
-  for (let i = 0; i < dispatchNodes.length; i++) {
-    const node = dispatchNodes[i]!;
     const handler = opRegistry.get(node.target)!;
     const pass = encoder.beginComputePass({
-      timestampWrites: { querySet, beginningOfPassWriteIndex: i * 2, endOfPassWriteIndex: i * 2 + 1 },
+      timestampWrites: { querySet, beginningOfPassWriteIndex: dispatchIndex * 2, endOfPassWriteIndex: dispatchIndex * 2 + 1 },
     });
     const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool, transientBuffers);
     handler(ctx);
@@ -156,6 +169,9 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     if (!isMultiOutput && !resolved.has(node.name)) {
       throw new KumaManifestError(`Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`);
     }
+
+    dispatchNodes.push(node);
+    dispatchIndex++;
   }
 
   encoder.resolveQuerySet(querySet, 0, dispatchNodes.length * 2, queryBuffer, 0);

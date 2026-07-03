@@ -323,7 +323,9 @@ const TEMPLATE = `
 // a `low-memory` player serializes to a single in-flight frame. See `maxInFlight` below.
 const DEFAULT_MAX_IN_FLIGHT = BUFFER_POOL_DEPTH;
 const DEFAULT_PLAY_SWEEP_MS = 6000;
-const PLAY_MIN_FRAME_INTERVAL_MS = 1000 / 60;
+// Fallback pacing for models with no fps in their .iph metadata -- a reasonable
+// scrubbing/preview cadence, not a target to hit when the real fps is known.
+const DEFAULT_PLAY_FRAME_INTERVAL_MS = 1000 / 60;
 const STALL_THRESHOLD_MS = 50;
 const PROFILE_WARMUP_RUNS = 5;
 
@@ -370,6 +372,14 @@ export class KumaPlayer extends HTMLElement {
   private frameSequence = 0;
   private latestRenderedSequence = -1;
   private playSweepMs = DEFAULT_PLAY_SWEEP_MS;
+  // How often playTick actually submits a new inference -- driven by the model's own
+  // authored fps (from .iph playback metadata) so playback doesn't run inference more
+  // often than the source video actually had distinct frames. A model can compute a
+  // frame in a fraction of a millisecond, but sampling it at, say, 240Hz for a 24fps
+  // source doesn't make the video smoother -- it just burns GPU on in-between times
+  // nothing was ever encoded at, and reads as motion-smoothed/sped-up rather than
+  // "faithful playback at real duration."
+  private playFrameIntervalMs = DEFAULT_PLAY_FRAME_INTERVAL_MS;
   private lastPlayFrameMs = -Infinity;
   private debugVisible = false;
 
@@ -556,9 +566,11 @@ export class KumaPlayer extends HTMLElement {
       this.log(`warm-up done in ${(performance.now() - t0).toFixed(0)}ms.`);
     }
 
+    const playback = isOnnx ? this.onnxModel!.playback : this.model!.playback;
+    this.playFrameIntervalMs = playback?.fps ? 1000 / playback.fps : DEFAULT_PLAY_FRAME_INTERVAL_MS;
+
     if (durationSeconds !== undefined) {
       this.playSweepMs = durationSeconds * 1000;
-      const playback = isOnnx ? this.onnxModel!.playback : this.model!.playback;
       this.log(
         `playback: ${durationSeconds}s/sweep` +
           (playback?.fps !== undefined ? ` @ ${playback.fps}fps` : "") +
@@ -841,7 +853,7 @@ export class KumaPlayer extends HTMLElement {
       console.warn(`[kuma-player] main-thread stall: ${(nowMs - this.lastTickMs).toFixed(1)}ms between rAF callbacks`);
     }
     this.lastTickMs = nowMs;
-    if (nowMs - this.lastPlayFrameMs >= PLAY_MIN_FRAME_INTERVAL_MS) {
+    if (nowMs - this.lastPlayFrameMs >= this.playFrameIntervalMs) {
       this.lastPlayFrameMs = nowMs;
       const t = ((nowMs - this.playStartMs) % this.playSweepMs) / this.playSweepMs;
       this.updateT(t);
