@@ -24,7 +24,8 @@
   },
   "dependencies": {
     "fflate": "^0.8.2",
-    "onnxruntime-web": "^1.20.1"
+    "onnxruntime-web": "^1.20.1",
+    "webgpu-compute-kit": "file:../../webgpu-compute-kit"
   },
   "devDependencies": {
     "typescript": "^5.6.3",

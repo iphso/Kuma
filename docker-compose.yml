@@ -19,7 +19,16 @@ services:
     command: tests/ -v
 
   bart-test:
-    build: ./kuma-bart
+    build:
+      context: ./kuma-bart
+      # kuma-bart depends on webgpu-compute-kit as a local `file:../../webgpu-compute-kit`
+      # package (see kuma-bart/package.json) -- Docker's build context can't reach outside
+      # ./kuma-bart on its own, so the sibling checkout is brought in as a named
+      # additional context and COPY'd to /webgpu-compute-kit in kuma-bart/Dockerfile
+      # (matching where `file:../../webgpu-compute-kit` resolves to from /workspace).
+      # Requires webgpu-compute-kit/dist/ to already be built on the host.
+      additional_contexts:
+        webgpu-compute-kit: ../webgpu-compute-kit
     volumes:
       - ./kuma-bart/src:/workspace/src
       - ./kuma-bart/test:/workspace/test
@@ -32,7 +41,10 @@ services:
     command: npm run test
 
   bart-demo:
-    build: ./kuma-bart
+    build:
+      context: ./kuma-bart
+      additional_contexts:
+        webgpu-compute-kit: ../webgpu-compute-kit
     volumes:
       - ./kuma-bart/src:/workspace/src
       - ./kuma-bart/demo:/workspace/demo

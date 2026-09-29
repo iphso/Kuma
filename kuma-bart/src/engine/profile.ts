@@ -7,6 +7,7 @@ import { readBuffers } from "../gpu/buffers.js";
 import type { SnippetFn } from "./snippets.js";
 import { resolveSwitches, type RunGraphParams } from "./scheduler.js";
 import { synthesizeWeight } from "./synthetic_weights.js";
+import { TimestampProfiler } from "webgpu-compute-kit";
 
 export interface OpTiming {
   name: string;
@@ -28,19 +29,6 @@ export interface ProfileReport {
   /** Same data grouped by aten target (op "class"), sorted by total time descending --
    * this is the "where do I focus" view. */
   byTarget: TargetTiming[];
-}
-
-async function readTimestamps(device: GPUDevice, queryBuffer: GPUBuffer, count: number): Promise<BigUint64Array> {
-  const byteLength = count * 8; // GPUQuerySet timestamp entries are u64 nanoseconds
-  const staging = device.createBuffer({ size: byteLength, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-  const encoder = device.createCommandEncoder();
-  encoder.copyBufferToBuffer(queryBuffer, 0, staging, 0, byteLength);
-  device.queue.submit([encoder.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const copy = new BigUint64Array(staging.getMappedRange(0, byteLength).slice(0));
-  staging.unmap();
-  staging.destroy();
-  return copy;
 }
 
 /**
@@ -108,11 +96,10 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     dispatchCount++;
   }
 
-  const querySet = device.createQuerySet({ type: "timestamp", count: dispatchCount * 2 });
-  const queryBuffer = device.createBuffer({
-    size: dispatchCount * 2 * 8,
-    usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
-  });
+  // TimestampProfiler (webgpu-compute-kit) owns the query-set/readback-buffer mechanics;
+  // this function still owns the graph-specific part -- deciding what counts as "a
+  // dispatch" and walking the manifest in order.
+  const profiler = new TimestampProfiler(device, dispatchCount);
 
   const encoder = device.createCommandEncoder();
   // See scheduler.ts / OpContext: fresh non-pooled buffers (incl. op-internal
@@ -123,7 +110,6 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   // dispatching a timestamped GPU pass for every other node.
   const dispatchNodes: GraphNode[] = [];
   let outputNode: GraphNode | undefined;
-  let dispatchIndex = 0;
 
   for (const node of nodes) {
     if (node.op === "placeholder") {
@@ -158,9 +144,7 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     }
 
     const handler = opRegistry.get(node.target)!;
-    const pass = encoder.beginComputePass({
-      timestampWrites: { querySet, beginningOfPassWriteIndex: dispatchIndex * 2, endOfPassWriteIndex: dispatchIndex * 2 + 1 },
-    });
+    const pass = profiler.beginPass(encoder, node.name);
     const ctx = new OpContext(device, kernels, pipelineCache, pass, resolved, node, constantCache, bufferPool, transientBuffers);
     handler(ctx);
     pass.end();
@@ -171,10 +155,9 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     }
 
     dispatchNodes.push(node);
-    dispatchIndex++;
   }
 
-  encoder.resolveQuerySet(querySet, 0, dispatchNodes.length * 2, queryBuffer, 0);
+  profiler.resolve(encoder);
   device.queue.submit([encoder.finish()]);
   releaseGenerationSlot(device, bufferPool);
 
@@ -193,9 +176,8 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
   // final copy-out), same as a real model.run() call would actually pay for.
   await readBuffers(device, reads);
 
-  const timestamps = await readTimestamps(device, queryBuffer, dispatchNodes.length * 2);
-  querySet.destroy();
-  queryBuffer.destroy();
+  const timings = await profiler.readResults();
+  profiler.destroy();
 
   // ProfileReport doesn't hand any buffer back to the caller, so everything except
   // weights and pooled buffers (which persist by design -- see context.ts's
@@ -227,11 +209,11 @@ export async function profileGraph(params: RunGraphParams): Promise<ProfileRepor
     destroyIfTemporary(buffer);
   }
 
-  const perNode: OpTiming[] = dispatchNodes.map((node, i) => {
-    const start = timestamps[i * 2]!;
-    const end = timestamps[i * 2 + 1]!;
-    return { name: node.name, target: node.target, microseconds: Number(end - start) / 1000 };
-  });
+  const perNode: OpTiming[] = dispatchNodes.map((node, i) => ({
+    name: node.name,
+    target: node.target,
+    microseconds: timings[i]!.microseconds,
+  }));
 
   const byTargetMap = new Map<string, { total: number; count: number }>();
   for (const t of perNode) {
