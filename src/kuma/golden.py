@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 import torch.export
 import torch.fx
@@ -40,39 +41,48 @@ def _spread_indices(n: int, count: int = _SPREAD_SAMPLES) -> list[int]:
         indices.append(state % n)
     return indices
 
-
-def _tensor_stats(t: torch.Tensor) -> dict[str, Any]:
-    flat = t.detach().to(torch.float32).reshape(-1)
-    n = flat.numel()
-    finite_mask = torch.isfinite(flat)
+def array_stats(value: Any) -> dict[str, Any] | None:
+    """Summary stats for one real-valued array (numpy or anything np.asarray accepts).
+    Shared by the torch golden path (below) and the ONNX backend's reference-evaluator
+    golden capture, so both emit byte-for-byte the same golden.json schema. Returns
+    None for non-numeric arrays."""
+    arr = np.asarray(value)
+    if not (np.issubdtype(arr.dtype, np.number) or np.issubdtype(arr.dtype, np.bool_)):
+        return None
+    flat = arr.astype(np.float32, copy=False).reshape(-1)
+    n = int(flat.size)
+    finite_mask = np.isfinite(flat)
     finite_vals = flat[finite_mask]
     nfin = int(finite_mask.sum())
-    mean = float(finite_vals.mean()) if nfin else float("nan")
-    mn = float(finite_vals.min()) if nfin else float("nan")
-    mx = float(finite_vals.max()) if nfin else float("nan")
     spread_idx = _spread_indices(n)
     return {
-        "shape": list(t.shape),
+        "shape": list(arr.shape),
         "n": n,
         "finite": nfin,
-        "mean": mean,
-        "min": mn,
-        "max": mx,
+        "mean": float(finite_vals.mean()) if nfin else float("nan"),
+        "min": float(finite_vals.min()) if nfin else float("nan"),
+        "max": float(finite_vals.max()) if nfin else float("nan"),
         "first": flat[: min(_FIRST_SAMPLES, n)].tolist(),
         "spread_indices": spread_idx,
         "spread": [float(flat[i]) for i in spread_idx],
     }
 
 
-def _value_stats(value: Any) -> dict[str, Any] | None:
-    """Stats for one node's runtime value. Real part always under "re"; an "im" key is
-    added only when the value is complex -- mirroring kuma-bart's ResolvedTensor.imag
-    pairing (a complex value is never one interleaved buffer on either side)."""
-    if not torch.is_tensor(value):
+def value_stats(value: Any) -> dict[str, Any] | None:
+    """Stats for one node's runtime value (torch tensor or numpy array). Real part always
+    under "re"; an "im" key is added only when the value is complex -- mirroring
+    kuma-bart's ResolvedTensor.imag pairing (a complex value is never one interleaved
+    buffer on either side). Returns None for non-tensor values."""
+    if torch.is_tensor(value):
+        value = value.detach().cpu()
+        value = value.resolve_conj().numpy() if torch.is_complex(value) else value.to(torch.float32).numpy()
+    elif not isinstance(value, np.ndarray):
         return None
-    if torch.is_complex(value):
-        return {"re": _tensor_stats(value.real), "im": _tensor_stats(value.imag)}
-    return {"re": _tensor_stats(value)}
+    if np.iscomplexobj(value):
+        re, im = array_stats(value.real), array_stats(value.imag)
+        return {"re": re, "im": im} if re is not None and im is not None else None
+    re = array_stats(value)
+    return {"re": re} if re is not None else None
 
 
 class _GoldenInterpreter(torch.fx.Interpreter):
@@ -91,7 +101,7 @@ class _GoldenInterpreter(torch.fx.Interpreter):
         result = super().run_node(n)
         if n.op in ("placeholder", "output"):
             return result
-        stats = _value_stats(result)
+        stats = value_stats(result)
         if stats is not None:
             self.captured[n.name] = stats
         return result

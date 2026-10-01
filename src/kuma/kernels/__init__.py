@@ -13,7 +13,8 @@ _KERNEL_NAMES: tuple[str, ...] = (
     "minimum.wgsl",
     # elementwise unary / activations
     "relu.wgsl",
-    "gelu.wgsl",
+    "gelu.wgsl",  # approximate="tanh"
+    "gelu_erf.wgsl",  # approximate="none" (exact-erf form; nn.GELU default)
     "silu.wgsl",
     "hardswish.wgsl",
     "sigmoid.wgsl",

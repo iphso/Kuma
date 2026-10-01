@@ -13,32 +13,14 @@ except ImportError:
     from torch._export.graph_signature import InputKind, OutputKind  # type: ignore[no-redef]
 
 
-_DTYPE_NAMES: dict[torch.dtype, str] = {
-    torch.float32: "float32",
-    torch.float16: "float16",
-    torch.bfloat16: "bfloat16",
-    torch.float64: "float64",
-    torch.int32: "int32",
-    torch.int64: "int64",
-    torch.bool: "bool",
-}
-
-
-def _dtype_str(dtype: Any) -> str | None:
-    if dtype is None:
-        return None
-    return _DTYPE_NAMES.get(dtype, str(dtype))
-
-
 def build_playback_meta(fps: float | None, duration_seconds: float | None) -> dict[str, float] | None:
     """Neither value is derivable from the graph itself -- a model is just a function
     of its inputs, with no intrinsic notion of "real time" unless the caller actually
     knows it (e.g. a time-routed multi-segment export authored at a given fps/duration).
     Returns None (not e.g. a dict of zeros) when the caller provides neither, so the
     manifest's optional "playback" key is simply omitted -- a runtime falls back to its
-    own default sweep duration in that case, same as before this existed. Shared by
-    kuma.compiler.compile and kuma.branching.compile_branching, the two manifest-
-    building entry points that accept this metadata."""
+    own default sweep duration in that case. Shared by every manifest-building entry
+    point that accepts this metadata (torch, ONNX, and all branching paths)."""
     meta: dict[str, float] = {}
     if fps is not None:
         meta["fps"] = fps
@@ -85,7 +67,9 @@ def build_manifest(
             entry["dtype"] = meta.get("dtype")
         outputs.append(entry)
 
-    # Collect unique ATen ops and find unrecognized ones
+    # Collect unique ATen ops. `unsupported_ops` is always empty on the torch path and
+    # informational only (the ONNX backend lists ONNX op types it couldn't convert):
+    # kuma-bart does not read it -- its own opRegistry is the authority on what runs.
     ops_seen: dict[str, int] = {}
     unsupported_ops: list[str] = []
     for node in graph_nodes:

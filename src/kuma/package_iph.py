@@ -44,7 +44,7 @@ class Package:
                 zf.writestr(f"models/{name}", data)
             zf.writestr("debug_report.md", self.debug_report)
             if self.golden is not None:
-                zf.writestr("golden.json", json.dumps(self.golden))
+                zf.writestr("golden.json", json.dumps(self.golden, sort_keys=True))
         return out
 
     def write_dir(self, out_dir: str | Path) -> Path:
@@ -58,7 +58,7 @@ class Package:
         (out_dir / "exported_graph.json").write_text(json.dumps(self.graph_data, indent=2))
         (out_dir / "debug_report.md").write_text(self.debug_report)
         if self.golden is not None:
-            (out_dir / "golden.json").write_text(json.dumps(self.golden, indent=2))
+            (out_dir / "golden.json").write_text(json.dumps(self.golden, indent=2, sort_keys=True))
 
         kernels_dir = out_dir / "kernels"
         kernels_dir.mkdir(exist_ok=True)

@@ -101,7 +101,23 @@ pip install -e /kuma
 pip install git+https://github.com/yourorg/kuma.git
 ```
 
-**Direct Python API (the only entry point — there is no CLI):**
+**Direct Python API.** There is no installed CLI (the `export` Docker service just runs
+`examples/export_simple.py`); the package exposes several Python entry points:
+
+| Entry point | Input | Output package format |
+|---|---|---|
+| `kuma.export_model(model, inputs, out, backend="torch"\|"onnx")` | `nn.Module` | `"kuma"` (unknown `backend` raises) |
+| `kuma.export_exported_program(ep, out)` / `kuma.compile(ep)` | `ExportedProgram` | `"kuma"` |
+| `kuma.compile_branching(...)` | N `ExportedProgram`s + JS router | `"kuma"` with a `switch` node |
+| `kuma.export_via_onnx(model, inputs)` | `nn.Module` via ONNX | `"kuma"` |
+| `kuma.compile_branching_onnx_kuma(...)` | N modules via ONNX + JS router | `"kuma"` with a `switch` node |
+| `kuma.compile_onnx(...)` / `kuma.compile_branching_onnx(...)` | module(s) | `"onnx"` / `"onnx-branching"` (raw ONNX models, run by kuma-bart's onnxruntime-web `OnnxModel` path, not its WGSL interpreter) |
+
+Every entry point that takes an `nn.Module` validates it the same way (tuple of cpu float32 tensors, float32
+parameters, float32/int64/bool buffers). The ONNX paths need the `onnx` package, which
+is a hard dependency in `pyproject.toml`.
+
+Typical torch-path usage:
 
 ```python
 import torch
@@ -149,7 +165,7 @@ kuma.export_model(model, example_inputs, out="artifacts/mymodel.iph")
 
 ```
 tests/
-  conftest.py            # run_pipeline() fixture (kuma.compile -> Package) + shared assertion helpers
+  conftest.py            # run_pipeline() fixture (kuma.compile or export_via_onnx -> Package) + shared assertion helpers
   test_package_iph.py    # .iph zip contract + top-level kuma.export_model/export_exported_program/compile API
   test_artifacts.py      # file existence, size consistency, JSON schema, roundtrip
   test_conv.py           # Conv2d variants, depthwise, 1×1, ConvTranspose2d
@@ -167,32 +183,67 @@ tests/
   test_pooling.py        # MaxPool2d, AvgPool2d, AdaptiveAvgPool2d
   test_shapes.py         # flatten, reshape, permute, transpose, squeeze/unsqueeze
   test_upsample.py       # nn.Upsample, ConvTranspose2d, PixelShuffle
+  test_branching.py      # compile_branching (torch), compile_onnx, compile_branching_onnx,
+                         # branch validation (lengths/indices/output shapes), torch golden capture
+  test_onnx_backend.py   # same models through backend="torch" and backend="onnx"
+  test_onnx_branching.py # compile_branching_onnx_kuma structure + golden correctness
+  test_onnx_converters.py # per-converter regressions (MatMul/Gemm/Gather/Conv/ConvTranspose/
+                         # Flatten/GELU), folding/name-collision/golden-determinism checks
 ```
+
+Note that the torch-path tests only check the *compiler's* output contract: several ops
+covered here (pooling, upsampling, BatchNorm, ConvTranspose2d) compile fine but have no
+handler in kuma-bart's opRegistry yet, so such packages fail at load/run time there.
 
 ## Project layout
 
 ```
 src/kuma/
-  __init__.py       # public API: export_model, export_exported_program, compile, Package
+  __init__.py       # public API (see "Entry points" below) + Package
   compiler.py       # compile(ep) -> Package; export_model/export_exported_program
-  export.py         # validation + torch.export.export wrapper (export_program)
+  export.py         # validate_model_and_inputs + torch.export.export wrapper (export_program)
   graph.py          # FX graph → JSON-friendly dict (serialize_graph)
-  pack_weights.py   # Parameters/buffers → contiguous f32 blob (pack_weights)
-  manifest.py       # manifest dict builder (build_manifest)
+  pack_weights.py   # Parameters/buffers → contiguous f32 blob (pack_weights); the shared
+                    # 4-byte alignment helpers (append_aligned/pack_f32_arrays)
+  manifest.py       # manifest dict builder (build_manifest, build_playback_meta)
+  golden.py         # golden.json capture: per-node value stats from an eager run
+                    # (shared stats code for the torch and ONNX paths)
   debug.py          # debug report generator (generate_debug_report)
   package_iph.py    # Package dataclass: .save() writes the .iph zip, .write_dir() writes loose files
+  branching.py      # compile_branching: N torch.export'd branches + JS router -> one package
+  branch_assembly.py # shared router/switch graph + branch namespacing/weight concatenation
+                    # used by all three branching entry points
+  onnx_backend.py   # export_via_onnx / compile_branching_onnx_kuma: torch -> ONNX -> Kuma graph
+  onnx_ops.py       # ONNX op -> aten target converters used by onnx_backend
+  onnx_compiler.py  # compile_onnx / compile_branching_onnx: raw ONNX models in the .iph
+                    # (format "onnx" / "onnx-branching"; kuma-bart runs these via onnxruntime-web, kuma-bart/src/onnx/)
   kernels/          # embedded WGSL kernels — elementwise binary/unary ops, matmul/conv
                      # (incl. transposed, plus depthwise/pointwise-specialized fast paths
                      # conv2d_depthwise.wgsl/conv2d_pointwise.wgsl alongside the general
                      # conv2d.wgsl), reductions, norm (layer/batch/group), pooling
                      # (max/avg/adaptive-avg), upsampling (nearest/bilinear), pixel-shuffle,
                      # and shape ops (reshape/permute/concat/slice) — bundled into every
-                     # .iph package. See kernels/__init__.py for the full list.
+                     # .iph package. See kernels/__init__.py for the full list. GELU has two:
+                     # gelu.wgsl (approximate="tanh") and gelu_erf.wgsl (erf form, nn.GELU's
+                     # default); the manifest node's `approximate` kwarg says which applies.
 examples/
   simple.py         # Conv2d → GELU → Conv2d → residual add (acceptance-test model)
   export_simple.py  # Acceptance-test runner (Docker ENTRYPOINT for the `export` service)
-artifacts/          # git-ignored; created by the exporter at runtime
+artifacts/          # NOT git-ignored: committed demo models (beauty/bosphorus/bunny/honey/
+                    # jockey/ready/shake/yacht.iph, their half*.iph variants) and the
+                    # acceptance-test output simple.iph + simple/. `export` overwrites
+                    # simple*; don't delete the committed .iph files.
 ```
+
+### Cross-repo coupling: synthesized DFT weights
+
+`pack_weights` deliberately skips any tensor whose name contains
+`.complex_tucker.lifted_tensor_` (the fixed DFT/iDFT basis matrices torch.export lifts out
+of the complex-Tucker spectral layers). They are not in `weights.f32.bin`; kuma-bart
+regenerates them from name + shape in `kuma-bart/src/engine/synthetic_weights.ts`, which
+matches the same `\.complex_tucker\.lifted_tensor_(\d+)$` pattern (indices 0/1 = complex
+iFFT cos/sin, 2/3 = irfft bases). Changing the pattern or index meaning on either side
+breaks the other silently.
 
 ## Key constraints (Step 1 scope)
 

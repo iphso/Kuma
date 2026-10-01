@@ -19,6 +19,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from kuma.branch_assembly import build_router_switch_nodes, check_branch_output_shapes, validate_branching_args
+from kuma.export import validate_model_and_inputs
 from kuma.manifest import build_playback_meta
 from kuma.package_iph import Package
 
@@ -59,6 +61,7 @@ def compile_onnx(
     input_names/output_names default to ["input"] / ["output"] when not given;
     callers that care about the names a downstream runtime will see should pass them.
     """
+    validate_model_and_inputs(wrapper, example_inputs)
     in_names = input_names or ["input"]
     out_names = output_names or ["output"]
 
@@ -89,6 +92,16 @@ def compile_onnx(
     )
 
 
+def _eager_output_shape(wrapper: nn.Module, example_inputs: tuple) -> list[int] | None:
+    """Shape of the wrapper's (first) eager output for its example inputs -- used only to
+    check every branch of a switch produces the same shape."""
+    with torch.no_grad():
+        out = wrapper.eval()(*example_inputs)
+    if isinstance(out, (tuple, list)):
+        out = out[0] if out else None
+    return list(out.shape) if torch.is_tensor(out) else None
+
+
 def compile_branching_onnx(
     router_snippet_name: str,
     router_snippet_source: str,
@@ -107,12 +120,24 @@ def compile_branching_onnx(
 ) -> Package:
     """Export each branch wrapper to ONNX and assemble a branching .iph.
 
-    The router JS snippet and switch-node graph structure mirror compile_branching
-    exactly. Each branch's "nodes" list is replaced by a {"model_file": "models/..."}
-    reference so a runtime dispatches to the correct ONNX model for the selected branch.
+    The router JS snippet and switch-node graph structure are shared with
+    compile_branching (kuma.branch_assembly). Each branch's "nodes" list is replaced by
+    a {"model_file": "models/..."} reference so a runtime dispatches to the correct ONNX
+    model for the selected branch. Every branch must produce the same output shape.
     """
-    if not branch_wrappers:
-        raise ValueError("compile_branching_onnx requires at least one branch")
+    validate_branching_args(
+        router_output_specs=router_output_specs,
+        selector_output_index=selector_output_index,
+        branch_input_output_index=branch_input_output_index,
+        n_branches=len(branch_wrappers),
+        n_example_inputs=len(branch_example_inputs),
+        branches_arg="branch_wrappers",
+    )
+    for wrapper, example_inp in zip(branch_wrappers, branch_example_inputs):
+        validate_model_and_inputs(wrapper, example_inp)
+    check_branch_output_shapes(
+        [_eager_output_shape(w, inp) for w, inp in zip(branch_wrappers, branch_example_inputs)]
+    )
 
     in_names = branch_input_names or ["input"]
     out_names = branch_output_names or ["output"]
@@ -127,61 +152,15 @@ def compile_branching_onnx(
         total_onnx_bytes += len(onnx_bytes)
         branch_specs.append({"model_file": f"models/{filename}"})
 
-    # Router node + getitem unpacking (identical structure to compile_branching)
-    router_node_name = "router"
-    router_node: dict[str, Any] = {
-        "id": 0,
-        "name": router_node_name,
-        "op": "js_snippet",
-        "target": router_snippet_name,
-        "args": [{"node_ref": name} for name in router_input_names],
-        "kwargs": {},
-        "meta": {
-            "outputs": [
-                {"shape": spec["shape"], "dtype": spec.get("dtype", "float32")}
-                for spec in router_output_specs
-            ]
-        },
-    }
-
-    getitem_names: list[str] = []
-    getitem_nodes: list[dict[str, Any]] = []
-    for i, spec in enumerate(router_output_specs):
-        name = f"router_out_{i}"
-        getitem_names.append(name)
-        getitem_nodes.append({
-            "id": i + 1,
-            "name": name,
-            "op": "call_function",
-            "target": "getitem",
-            "args": [{"node_ref": router_node_name}, i],
-            "kwargs": {},
-            "meta": {},
-        })
-
-    # Switch node: branches reference ONNX files instead of inlined node lists
-    switch_node: dict[str, Any] = {
-        "id": 1_000_000,
-        "name": "switch_0",
-        "op": "switch",
-        "target": "switch",
-        "args": [{"node_ref": getitem_names[branch_input_output_index]}],
-        "kwargs": {},
-        "meta": {},
-        "selector": {"node_ref": getitem_names[selector_output_index]},
-        "branches": branch_specs,
-    }
-    output_node: dict[str, Any] = {
-        "id": 1_000_001,
-        "name": "output",
-        "op": "output",
-        "target": "output",
-        "args": [[{"node_ref": "switch_0"}]],
-        "kwargs": {},
-        "meta": {},
-    }
-
-    all_nodes = [router_node, *getitem_nodes, switch_node, output_node]
+    all_nodes = build_router_switch_nodes(
+        router_snippet_name=router_snippet_name,
+        router_input_names=router_input_names,
+        router_output_specs=router_output_specs,
+        selector_output_index=selector_output_index,
+        branch_input_output_index=branch_input_output_index,
+        branches=branch_specs,
+        switch_meta={},
+    )
 
     manifest: dict[str, Any] = {
         "format": "onnx-branching",

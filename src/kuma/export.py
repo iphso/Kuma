@@ -33,6 +33,16 @@ def _validate_parameters(model: torch.nn.Module) -> None:
             )
 
 
+def validate_model_and_inputs(model: torch.nn.Module, example_inputs: tuple) -> None:
+    """The input/parameter checks every capture path (torch.export and both ONNX
+    paths) runs before tracing: example_inputs must be a tuple of cpu float32 tensors,
+    parameters float32, buffers float32/int64/bool. Fails loudly otherwise."""
+    if not isinstance(example_inputs, tuple):
+        raise TypeError(f"example_inputs must be a tuple, got {type(example_inputs)}")
+    _validate_inputs(example_inputs)
+    _validate_parameters(model)
+
+
 def export_program(
     model: torch.nn.Module,
     example_inputs: tuple,
@@ -42,12 +52,8 @@ def export_program(
 
     Fails loudly on unsupported dtypes, non-CPU tensors, or dynamic-shape graphs.
     """
-    if not isinstance(example_inputs, tuple):
-        raise TypeError(f"example_inputs must be a tuple, got {type(example_inputs)}")
-
     model.eval()
-    _validate_inputs(example_inputs)
-    _validate_parameters(model)
+    validate_model_and_inputs(model, example_inputs)
 
     with torch.no_grad():
         return torch.export.export(model, example_inputs)

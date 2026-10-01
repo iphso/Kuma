@@ -13,6 +13,7 @@ from kuma.golden import capture_golden
 from kuma.graph import serialize_graph
 from kuma.kernels import load_kernels
 from kuma.manifest import build_manifest, build_playback_meta
+from kuma.onnx_backend import export_via_onnx
 from kuma.pack_weights import pack_weights
 from kuma.package_iph import Package
 
@@ -82,15 +83,19 @@ def export_model(
     fps: float | None = None,
     duration_seconds: float | None = None,
 ) -> Path:
-    """Run torch.export.export on `model` and save the result as a .iph package.
+    """Capture `model` and save the result as a .iph package.
 
-    backend="torch"  — direct torch.export path (default, existing behaviour)
-    backend="onnx"   — export via ONNX as an intermediary (requires onnx package)
+    backend="torch"  — direct torch.export path (default)
+    backend="onnx"   — torch.onnx.export first, then ONNX -> Kuma graph
+                       (kuma.onnx_backend.export_via_onnx)
+
+    Any other backend raises ValueError.
     """
     if backend == "onnx":
-        from kuma.onnx_backend import export_via_onnx
         return export_via_onnx(
             model, example_inputs, fps=fps, duration_seconds=duration_seconds
         ).save(out)
+    if backend != "torch":
+        raise ValueError(f"export_model: unknown backend {backend!r}; expected 'torch' or 'onnx'")
     ep = export_program(model, example_inputs)
     return export_exported_program(ep, out, example_inputs, fps=fps, duration_seconds=duration_seconds)
