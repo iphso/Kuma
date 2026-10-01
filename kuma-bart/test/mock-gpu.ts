@@ -1,23 +1,28 @@
 /** A minimal fake GPUDevice for exercising the scheduler's structural logic (node
- * resolution, dispatch ordering, error paths) without a real GPU. It doesn't compute
- * anything — readback buffers are zero-filled — so it can't verify numeric correctness;
- * that requires a real browser (see kuma-bart's plan notes). Tracks dispatch calls so
- * tests can assert "this op dispatched N kernels" (e.g. 0 for free passthroughs). */
-export function createMockDevice() {
+ * resolution, dispatch ordering, buffer ownership, error paths) without a real GPU. It
+ * doesn't compute anything — readback buffers are zero-filled — so it can't verify
+ * numeric correctness; that needs a real browser (`model.verify()` in the demo).
+ *
+ * Records every dispatch's workgroup count (`dispatches`) and the label of the pipeline
+ * it ran (`kernels` -- pipelines are labeled with their kernel filename, e.g.
+ * "relu.wgsl"), plus every buffer created and destroyed, so tests can assert dispatch
+ * sequences by kernel name and measure leaks. */
+export function createMockDevice(options: { features?: string[] } = {}) {
   const dispatches: number[] = [];
-  // Tracks every buffer .destroy() is called on -- e.g. for asserting a pooled buffer
-  // (which must persist across calls, see context.ts's BufferPoolState) is never one
-  // of them, the same way `dispatches` lets a test assert dispatch counts.
+  const kernels: string[] = [];
   const destroyedBuffers = new Set<object>();
-  // Every buffer ever created (with its usage flags) -- lets a test measure leaks: a
-  // buffer in `createdBuffers` but not `destroyedBuffers` is still live.
+  // A buffer in `createdBuffers` but not `destroyedBuffers` is still live.
   const createdBuffers = new Set<{ usage: number }>();
+  let currentPipeline = "";
 
   const pass = {
-    setPipeline: () => {},
+    setPipeline: (pipeline: { label?: string }) => {
+      currentPipeline = pipeline.label ?? "";
+    },
     setBindGroup: () => {},
     dispatchWorkgroups: (count: number) => {
       dispatches.push(count);
+      kernels.push(currentPipeline);
     },
     end: () => {},
   };
@@ -38,13 +43,14 @@ export function createMockDevice() {
   }
 
   const device = {
+    features: new Set(options.features ?? []),
     createBuffer: ({ size, usage = 0 }: { size: number; usage?: number }) => fakeBuffer(size, usage),
     createShaderModule: () => ({}),
-    createComputePipeline: () => ({ getBindGroupLayout: () => ({}) }),
+    createComputePipeline: ({ label }: { label?: string } = {}) => ({ label, getBindGroupLayout: () => ({}) }),
+    createQuerySet: () => ({ destroy: () => {} }),
     // Binding a buffer that's already been .destroy()'d is exactly the real WebGPU
     // "[Buffer] used in submit while destroyed" failure (a use-after-destroy the
-    // early-free liveness pass must never produce) -- surface it as a hard error so a
-    // test can assert against it.
+    // early-free liveness pass must never produce) -- surface it as a hard error.
     createBindGroup: ({ entries }: { entries?: Array<{ resource?: { buffer?: object } }> } = {}) => {
       for (const e of entries ?? []) {
         const buf = e?.resource?.buffer;
@@ -57,6 +63,7 @@ export function createMockDevice() {
     createCommandEncoder: () => ({
       beginComputePass: () => pass,
       copyBufferToBuffer: () => {},
+      resolveQuerySet: () => {},
       finish: () => ({}),
     }),
     queue: {
@@ -66,5 +73,7 @@ export function createMockDevice() {
     },
   };
 
-  return { device: device as unknown as GPUDevice, pass, dispatches, destroyedBuffers, createdBuffers };
+  return { device: device as unknown as GPUDevice, pass, dispatches, kernels, destroyedBuffers, createdBuffers };
 }
+
+export type MockDevice = ReturnType<typeof createMockDevice>;

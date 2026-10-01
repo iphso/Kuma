@@ -3,6 +3,7 @@ import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError } from "../errors.js";
 import { permuteMaybeComplex } from "./permute.js";
 import { planEinsum } from "../engine/einsum-plan.js";
+import { complexProduct } from "./complex_math.js";
 
 const BMM_TILE = 64;
 
@@ -14,36 +15,13 @@ function dispatchBmm(ctx: OpContext, aBuf: GPUBuffer, bBuf: GPUBuffer, batch: nu
   return out;
 }
 
-/**
- * Batched matmul, complex-aware: (a_re + a_im*i) @ (b_re + b_im*i)
- *   = (a_re@b_re - a_im@b_im) + (a_re@b_im + a_im@b_re)*i
- * Falls back to a single real bmm (no extra dispatches) when neither operand carries
- * an imaginary part — most contraction steps in practice are plain-real.
- */
+/** Batched matmul, complex-aware via complexProduct: a single real bmm when neither
+ * operand carries an imaginary part (most contraction steps in practice). */
 function dispatchComplexBmm(ctx: OpContext, a: ResolvedTensor, b: ResolvedTensor, batch: number, m: number, k: number, n: number): ResolvedTensor {
   const shape = [batch, m, n];
-  const reAB = dispatchBmm(ctx, a.buffer, b.buffer, batch, m, k, n);
-
-  if (!a.imag && !b.imag) {
-    return { buffer: reAB, shape };
-  }
-  if (a.imag && !b.imag) {
-    return { buffer: reAB, shape, imag: dispatchBmm(ctx, a.imag, b.buffer, batch, m, k, n) };
-  }
-  if (!a.imag && b.imag) {
-    return { buffer: reAB, shape, imag: dispatchBmm(ctx, a.buffer, b.imag, batch, m, k, n) };
-  }
-
-  const imIm = dispatchBmm(ctx, a.imag!, b.imag!, batch, m, k, n);
-  const reIm = dispatchBmm(ctx, a.buffer, b.imag!, batch, m, k, n);
-  const imRe = dispatchBmm(ctx, a.imag!, b.buffer, batch, m, k, n);
-
-  const size = batch * m * n;
-  const finalRe = ctx.createBuffer(shape);
-  ctx.dispatchKernel("sub.wgsl", [reAB, imIm, finalRe, ctx.uniform([size])], size);
-  const finalIm = ctx.createBuffer(shape);
-  ctx.dispatchKernel("add.wgsl", [reIm, imRe, finalIm, ctx.uniform([size])], size);
-  return { buffer: finalRe, shape, imag: finalIm };
+  const bmm = (x: GPUBuffer, y: GPUBuffer) => dispatchBmm(ctx, x, y, batch, m, k, n);
+  const { re, im } = complexProduct(ctx, { re: a.buffer, im: a.imag }, { re: b.buffer, im: b.imag }, bmm, shape);
+  return { buffer: re, shape, imag: im };
 }
 
 /**

@@ -2,6 +2,7 @@ import type { OpContext } from "../engine/context.js";
 import type { ArgValue } from "../types/manifest.js";
 import { KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
+import { dispatchBinary, dispatchUnary } from "./complex_math.js";
 
 /** aten.clamp.default args: (input, min=None, max=None). clamp.wgsl wants concrete
  * float bounds — its own header comment documents passing ±inf for an unbounded side. */
@@ -53,18 +54,11 @@ export function rsubScalarHandler(ctx: OpContext): void {
   const shape = node.meta.shape ?? input.shape;
   const n = numElements(shape);
 
-  // scalarArg is graph-structure-derived (a literal fixed at manifest-build time),
-  // never from actual input data -- same caching rationale as ctx.uniform/uniformTyped
-  // (see context.ts), so this is cached forever per-node rather than rebuilt and
-  // re-uploaded every single call.
-  const scalarBuffer = ctx.getOrUploadConstant(`rsub:${node.name}`, () => new Float32Array(n).fill(scalarArg));
-  const out = ctx.createBuffer(shape);
-  ctx.dispatchKernel("sub.wgsl", [scalarBuffer, input.buffer, out, ctx.uniform([n])], n);
-
-  let outImag: GPUBuffer | undefined;
-  if (input.imag) {
-    outImag = ctx.createBuffer(shape);
-    ctx.dispatchKernel("neg.wgsl", [input.imag, outImag, ctx.uniform([n])], n);
-  }
+  // A literal fixed at export time, never input data, so it is cached for the model's
+  // lifetime; the element count is part of the key so a node re-run at a different shape
+  // never binds a wrong-size buffer.
+  const scalarBuffer = ctx.getOrUploadConstant(`rsub:${node.name}:${n}`, () => new Float32Array(n).fill(scalarArg));
+  const out = dispatchBinary(ctx, "sub.wgsl", scalarBuffer, input.buffer, shape);
+  const outImag = input.imag ? dispatchUnary(ctx, "neg.wgsl", input.imag, shape) : undefined;
   ctx.setOutput(out, shape, outImag);
 }

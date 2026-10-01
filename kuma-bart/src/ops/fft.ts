@@ -4,6 +4,7 @@ import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { dispatchPermute } from "./permute.js";
 import { dispatchLinear } from "./linear.js";
 import { complexIfftBasis, irfftBasis } from "../engine/dft.js";
+import { complexProduct, dispatchBinary } from "./complex_math.js";
 
 function moveAxisToLast(ctx: OpContext, tensor: ResolvedTensor, axis: number): { result: ResolvedTensor; swapDims: number[] } {
   const rank = tensor.shape.length;
@@ -36,10 +37,8 @@ function matmulBasis(ctx: OpContext, x: ResolvedTensor, basis: ResolvedTensor): 
  * axis below, since that one collapses complex -> real). */
 function complexIfftAlongAxis(ctx: OpContext, real: ResolvedTensor, imag: ResolvedTensor, axis: number): { real: ResolvedTensor; imag: ResolvedTensor } {
   const n = real.shape[axis]!;
-  // cos/sin only depend on the transform length n, never on the actual data -- computing
-  // an n*n trig basis and re-uploading it from scratch on every single inference call
-  // (every frame, for a model run interactively) was pure waste. Cached for the lifetime
-  // of the model now (see OpContext.getOrUploadConstant).
+  // The bases depend only on the transform length, so they're cached for the model's
+  // lifetime (see OpContext.getOrUploadConstant).
   const cosBuffer = ctx.getOrUploadConstant(`complexIfft:cos:${n}`, () => complexIfftBasis(n).cos);
   const sinBuffer = ctx.getOrUploadConstant(`complexIfft:sin:${n}`, () => complexIfftBasis(n).sin);
   const cosTensor: ResolvedTensor = { buffer: cosBuffer, shape: [n, n] };
@@ -53,21 +52,13 @@ function complexIfftAlongAxis(ctx: OpContext, real: ResolvedTensor, imag: Resolv
   const real2d = { buffer: realMoved.buffer, shape: [m, k] };
   const imag2d = { buffer: imagMoved.buffer, shape: [m, k] };
 
-  // Re = cos@Xr - sin@Xi, Im = sin@Xr + cos@Xi (see engine/dft.ts).
-  const cosXr = matmulBasis(ctx, real2d, cosTensor);
-  const sinXi = matmulBasis(ctx, imag2d, sinTensor);
-  const sinXr = matmulBasis(ctx, real2d, sinTensor);
-  const cosXi = matmulBasis(ctx, imag2d, cosTensor);
-
-  const n2 = m * n;
-  const outRe = ctx.createBuffer([n2]);
-  ctx.dispatchKernel("sub.wgsl", [cosXr.buffer, sinXi.buffer, outRe, ctx.uniform([n2])], n2);
-  const outIm = ctx.createBuffer([n2]);
-  ctx.dispatchKernel("add.wgsl", [sinXr.buffer, cosXi.buffer, outIm, ctx.uniform([n2])], n2);
+  // (cos + i·sin) ⊗ (Xr + i·Xi): Re = cos@Xr - sin@Xi, Im = sin@Xr + cos@Xi (see engine/dft.ts).
+  const basisTimes = (basis: ResolvedTensor, x: ResolvedTensor) => matmulBasis(ctx, x, basis).buffer;
+  const { re: outRe, im: outIm } = complexProduct(ctx, { re: cosTensor, im: sinTensor }, { re: real2d, im: imag2d }, basisTimes, [m, n]);
 
   const movedShape = [...realMoved.shape.slice(0, -1), n];
   const reRestored = moveAxisBack(ctx, { buffer: outRe, shape: movedShape }, swapDims);
-  const imRestored = moveAxisBack(ctx, { buffer: outIm, shape: movedShape }, swapDims);
+  const imRestored = moveAxisBack(ctx, { buffer: outIm!, shape: movedShape }, swapDims);
   return { real: reRestored, imag: imRestored };
 }
 
@@ -75,8 +66,6 @@ function complexIfftAlongAxis(ctx: OpContext, real: ResolvedTensor, imag: Resolv
  * -> outputLength real values. Must run last (collapses complex -> real). */
 function realIfftLastAxis(ctx: OpContext, real: ResolvedTensor, imag: ResolvedTensor, outputLength: number): ResolvedTensor {
   const whalf = real.shape[real.shape.length - 1]!;
-  // Same reasoning as complexIfftAlongAxis's cos/sin -- a pure function of outputLength,
-  // cached rather than recomputed and re-uploaded every call.
   const aBuffer = ctx.getOrUploadConstant(`irfft:a:${outputLength}`, () => irfftBasis(outputLength).a);
   const bBuffer = ctx.getOrUploadConstant(`irfft:b:${outputLength}`, () => irfftBasis(outputLength).b);
   const aTensor: ResolvedTensor = { buffer: aBuffer, shape: [outputLength, whalf] };
@@ -88,12 +77,8 @@ function realIfftLastAxis(ctx: OpContext, real: ResolvedTensor, imag: ResolvedTe
 
   const aXr = matmulBasis(ctx, real2d, aTensor);
   const bXi = matmulBasis(ctx, imag2d, bTensor);
-
-  const n = m * outputLength;
-  const out = ctx.createBuffer([n]);
-  ctx.dispatchKernel("add.wgsl", [aXr.buffer, bXi.buffer, out, ctx.uniform([n])], n);
-
-  return { buffer: out, shape: [...real.shape.slice(0, -1), outputLength] };
+  const outShape = [...real.shape.slice(0, -1), outputLength];
+  return { buffer: dispatchBinary(ctx, "add.wgsl", aXr.buffer, bXi.buffer, outShape), shape: outShape };
 }
 
 /**

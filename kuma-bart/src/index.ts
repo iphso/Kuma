@@ -1,14 +1,14 @@
 export { KumaModel } from "./model.js";
 export type { KumaMemoryOptions } from "./model.js";
 export { OnnxModel } from "./onnx/model.js";
-export { KumaPlayer } from "./player/KumaPlayer.js";
+// <kuma-player> is deliberately not re-exported here: it extends HTMLElement, which would
+// break importing this entry under SSR/Node. Import "kuma-bart/player" to register it.
 export { KumaManifestError, KumaShapeError, KumaUnsupportedOpError } from "./errors.js";
-// Exposed so a caller pipelining multiple in-flight run()/runRaw()/runToGpu() calls
-// (e.g. demo/main.ts's MAX_IN_FLIGHT) can size its own concurrency cap against this --
-// submitting more calls concurrently than this doesn't get any more frames "in flight"
-// in practice, since runGraph's own pooled-buffer reuse internally blocks (awaiting
-// the GPU's real completion signal) once exceeded. See context.ts's BufferPoolState.
+// How many run()/runRaw()/runToGpu() calls a caller can usefully keep in flight with the
+// default memory options (prefer `model.maxInFlight`, which reflects the loaded model's
+// real pool depth): past this, runGraph's acquireGenerationSlot blocks on GPU completion.
 export { BUFFER_POOL_DEPTH } from "./engine/context.js";
+export { releaseOutputs } from "./engine/scheduler.js";
 export type { KumaManifest, IOSpec, WeightEntry, GraphNode, NodeRef, ArgValue, PlaybackMeta } from "./types/manifest.js";
 export type { GoldenData, GoldenBranch, GoldenNodeStats, GoldenTensorStats } from "./types/golden.js";
 export type { VerifyReport, BranchVerifyReport, NodeDiff, FieldDiff } from "./engine/verify.js";

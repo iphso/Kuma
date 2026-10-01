@@ -2,9 +2,9 @@ import type { GraphNode, KumaManifest } from "../types/manifest.js";
 import type { GoldenBranch, GoldenData, GoldenTensorStats } from "../types/golden.js";
 import type { ResolvedTensor, BufferPoolState } from "./context.js";
 import type { SnippetFn } from "./snippets.js";
-import { runGraph } from "./scheduler.js";
+import { runGraph, releaseOutputs, type RunGraphOutput } from "./scheduler.js";
 import { summarize } from "./stats.js";
-import { uploadFloat32 } from "../gpu/buffers.js";
+import { uploadFloat32 } from "webgpu-compute-kit";
 import { KumaManifestError } from "../errors.js";
 import { findLinearWeightElisions } from "../ops/index.js";
 
@@ -14,14 +14,10 @@ import { findLinearWeightElisions } from "../ops/index.js";
 // kind of divergence we've been chasing by hand shows up as differences of 10-1000x, not
 // a few ULPs.
 //
-// ATOL=4e-4 (not 1e-4): measured directly against the tiled linear.wgsl + 256-thread
-// groupnorm.wgsl rewrite, whose worst observed deviations from golden were ~2x the old
-// 1e-4 on small-magnitude (~1e-3) intermediate values, where ATOL is the dominant term
-// anyway (RTOL*|golden| is negligible at that scale) -- summing the same K terms in
-// 16-wide tiles, or reducing 256 elements at a time instead of 64, is a different but
-// equally valid float32 summation order from both the old kernels and from whatever
-// order PyTorch's own BLAS uses, and floating-point addition isn't associative. This
-// barely loosens the check for larger-magnitude values, where RTOL already dominates.
+// ATOL=4e-4: tiled linear.wgsl and 256-thread groupnorm.wgsl sum in a different (equally
+// valid) float32 order than PyTorch's BLAS; their worst observed deviations on ~1e-3-
+// magnitude values were ~2x 1e-4, where ATOL is the dominant term. RTOL dominates for
+// larger magnitudes, so this barely loosens the check there.
 const RTOL = 0.02;
 const ATOL = 4e-4;
 
@@ -79,10 +75,9 @@ function compareTensor(node: string, part: "re" | "im", golden: GoldenTensorStat
 
   const actual = summarize(actualData, golden.first.length);
   // Exact, not approxEqual -- a NaN/Inf appearing where golden has none (or vice
-  // versa) is exactly the class of bug this project has hit before (see norm.ts's eps
-  // fallback history), and ordinary float32 reduction-order differences between a GPU
-  // kernel and eager PyTorch don't flip a normal finite value into NaN/Infinity or
-  // back -- that takes an actual operation like 0/0 or overflow, not summation order.
+  // versa) is a real bug class (e.g. a missing norm eps), and ordinary float32
+  // reduction-order differences between a GPU kernel and eager PyTorch don't flip a
+  // finite value into NaN/Infinity or back -- that takes 0/0 or overflow.
   // mean/min/max alone can miss this: a handful of stray NaNs in an otherwise-large,
   // otherwise-correct-looking tensor can hide inside `mean` (NaN poisons it, which
   // would already be caught) but a small *count* mismatch with finite values still in
@@ -116,6 +111,44 @@ export interface VerifyContext {
   bufferPool: BufferPoolState;
 }
 
+/** Runs `manifest` against golden's recorded reference inputs. Only CPU-side results are
+ * returned: the uploaded inputs and every output buffer are released before returning. */
+async function runAgainstGolden(
+  ctx: VerifyContext,
+  manifest: KumaManifest,
+  golden: GoldenBranch,
+  options: { captureNodes?: ReadonlySet<string>; skipOutputReadback?: boolean },
+): Promise<RunGraphOutput[]> {
+  const inputBuffers = new Map<string, ResolvedTensor>();
+  const rawInputs = new Map<string, Float32Array>();
+  for (const [name, values] of Object.entries(golden.inputs)) {
+    const data = new Float32Array(values);
+    const shape = inputShapeFor(manifest, name, data.length);
+    rawInputs.set(name, data);
+    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape });
+  }
+  try {
+    const outputs = await runGraph({
+      device: ctx.device,
+      manifest,
+      kernels: ctx.kernels,
+      pipelineCache: ctx.pipelineCache,
+      weightBuffers: ctx.weightBuffers,
+      inputBuffers,
+      rawInputs,
+      snippets: ctx.snippets,
+      snippetCache: ctx.snippetCache,
+      constantCache: ctx.constantCache,
+      bufferPool: ctx.bufferPool,
+      ...options,
+    });
+    releaseOutputs(outputs);
+    return outputs;
+  } finally {
+    for (const t of inputBuffers.values()) t.buffer.destroy();
+  }
+}
+
 /** Runs one branch's subgraph directly against golden's own recorded reference input(s)
  * -- bypassing the time-based router entirely, so there's no need to reverse-engineer
  * which global `t` would have routed here. `nodes` must already include the `output`
@@ -128,49 +161,9 @@ async function verifyBranch(
   manifest: KumaManifest,
   golden: GoldenBranch,
 ): Promise<BranchVerifyReport> {
-  const inputBuffers = new Map<string, ResolvedTensor>();
-  const rawInputs = new Map<string, Float32Array>();
-  for (const [name, values] of Object.entries(golden.inputs)) {
-    const data = new Float32Array(values);
-    const shape = inputShapeFor(manifest, name, data.length);
-    rawInputs.set(name, data);
-    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape });
-  }
-
   const ignoredNodes = new Set(findLinearWeightElisions(manifest.graph.nodes).keys());
   const captureNodes = new Set(Object.keys(golden.nodes).filter((name) => !ignoredNodes.has(name)));
-  const outputs = await runGraph({
-    device: ctx.device,
-    manifest,
-    kernels: ctx.kernels,
-    pipelineCache: ctx.pipelineCache,
-    weightBuffers: ctx.weightBuffers,
-    inputBuffers,
-    rawInputs,
-    snippets: ctx.snippets,
-    snippetCache: ctx.snippetCache,
-    constantCache: ctx.constantCache,
-    bufferPool: ctx.bufferPool,
-    captureNodes,
-  });
-
-  // Diagnostic: log the first few captured values to help narrow down zeros-in-verify.
-  // The first non-output entry in `outputs` is capturedTensors[0] (earliest golden node
-  // in graph order). If this is already 0.0 for a node that should be non-zero, the
-  // issue is either in dispatch or in readback, not in downstream propagation.
-  if (outputs.length > 1) {
-    const sampleNames = outputs.slice(1, 4).map((o) => o.name);
-    const sampleMeans = outputs.slice(1, 4).map((o) => {
-      if (!o.data.length) return "empty";
-      const sum = Array.from(o.data).reduce((a, b) => a + b, 0);
-      return (sum / o.data.length).toFixed(6);
-    });
-    console.log(
-      `[kuma verify] branch ${branchIndex}: ${outputs.length - 1} captures, ` +
-      `input keys=[${Object.keys(golden.inputs).join(",")}], ` +
-      `first 3 captured nodes: ${sampleNames.map((n, i) => `${n}=mean(${sampleMeans[i]})`).join(", ")}`,
-    );
-  }
+  const outputs = await runAgainstGolden(ctx, manifest, golden, { captureNodes });
 
   const byName = new Map(outputs.map((o) => [o.name, o]));
   const mismatches: NodeDiff[] = [];
@@ -267,38 +260,7 @@ export async function verifyAgainstGolden(ctx: VerifyContext, manifest: KumaMani
 }
 
 async function warmUpBranch(ctx: VerifyContext, manifest: KumaManifest, golden: GoldenBranch): Promise<void> {
-  const inputBuffers = new Map<string, ResolvedTensor>();
-  const rawInputs = new Map<string, Float32Array>();
-  for (const [name, values] of Object.entries(golden.inputs)) {
-    const data = new Float32Array(values);
-    const shape = inputShapeFor(manifest, name, data.length);
-    rawInputs.set(name, data);
-    inputBuffers.set(name, { buffer: uploadFloat32(ctx.device, data), shape });
-  }
-
-  await runGraph({
-    device: ctx.device,
-    manifest,
-    kernels: ctx.kernels,
-    pipelineCache: ctx.pipelineCache,
-    weightBuffers: ctx.weightBuffers,
-    inputBuffers,
-    rawInputs,
-    snippets: ctx.snippets,
-    snippetCache: ctx.snippetCache,
-    constantCache: ctx.constantCache,
-    bufferPool: ctx.bufferPool,
-    skipOutputReadback: true,
-  });
-  // runGraph keeps the declared-output buffer alive for the caller by design (it has
-  // no way to know this call only cares about the side effect of warming up
-  // pipelines/pool/constants) -- this used to explicitly destroy it to avoid a leak,
-  // back when every output was a fresh, unpooled allocation. Now that node outputs
-  // come from ctx.bufferPool (see context.ts's BufferPoolState), that buffer is the
-  // *same* GPUBuffer object this branch's pool will keep reusing forever -- destroying
-  // it here would corrupt the pool for every future call against this branch, not
-  // free anything. Just let it be (warmUp only ever runs once per branch anyway, so
-  // there's no repeated-leak concern the old comment was guarding against).
+  await runAgainstGolden(ctx, manifest, golden, { skipOutputReadback: true });
 }
 
 /** Runs every branch a model has once, directly against golden's own recorded

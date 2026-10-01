@@ -67,8 +67,8 @@ export interface GraphNode {
  * notion of "real time" unless whoever authored the export actually knows it (e.g. a
  * time-routed multi-segment model meant to play back at a specific speed). A consumer
  * (e.g. the demo) should fall back to its own default sweep duration when this whole
- * key, or duration_seconds specifically, is absent -- not assume every model wants the
- * same fixed playback speed, which is exactly the bug this exists to fix. */
+ * key, or duration_seconds specifically, is absent, rather than assume every model wants
+ * the same fixed playback speed. */
 export interface PlaybackMeta {
   fps?: number;
   /** How many real seconds a full sweep of a normalized [0,1] time input should take. */
@@ -95,4 +95,12 @@ export interface KumaManifest {
 
 export function isNodeRef(v: ArgValue): v is NodeRef {
   return typeof v === "object" && v !== null && !Array.isArray(v) && "node_ref" in v;
+}
+
+/** Every `node_ref` in an arg value tree (nested lists included), in order, duplicates
+ * kept -- a node that passes the same tensor twice counts as two uses. */
+export function nodeRefsIn(arg: ArgValue, out: string[] = []): string[] {
+  if (isNodeRef(arg)) out.push(arg.node_ref);
+  else if (Array.isArray(arg)) for (const a of arg) nodeRefsIn(a, out);
+  return out;
 }

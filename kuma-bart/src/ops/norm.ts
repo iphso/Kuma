@@ -2,7 +2,7 @@ import type { OpContext } from "../engine/context.js";
 import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
-import { KERNEL_WORKGROUP_SIZE } from "../engine/dispatch.js";
+import { KERNEL_WORKGROUP_SIZE } from "../engine/context.js";
 
 /** aten.group_norm.default args: (input, num_groups, weight, bias, eps, cudnn_enabled).
  * The single-tensor-output wrapper, not the 3-tuple aten.native_group_norm.default.

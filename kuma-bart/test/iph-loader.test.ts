@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { strToU8, zipSync } from "fflate";
 import { describe, expect, it } from "vitest";
-import { loadIphPackage } from "../src/iph/loader.js";
+import { loadIphPackage, peekIphFormat } from "../src/iph/loader.js";
 import { KumaManifestError } from "../src/errors.js";
 
 const BASE_MANIFEST = {
@@ -62,5 +62,14 @@ describe("loadIphPackage", () => {
     expect(Array.isArray(manifest.graph.nodes)).toBe(true);
     expect(manifest.inputs[0]).toHaveProperty("shape");
     expect(manifest.weights[0]).toHaveProperty("byte_offset");
+  });
+});
+
+describe("peekIphFormat", () => {
+  it("reads the manifest's format without needing the rest of the package", () => {
+    expect(peekIphFormat(buildFakeIph())).toBe("kuma");
+    expect(peekIphFormat(buildFakeIph({ manifest: { ...BASE_MANIFEST, format: "onnx" } }))).toBe("onnx");
+    expect(peekIphFormat(buildFakeIph({ includeManifest: false }))).toBeUndefined();
+    expect(peekIphFormat(new Uint8Array([1, 2, 3]))).toBeUndefined();
   });
 });

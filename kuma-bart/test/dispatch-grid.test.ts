@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeDispatchGrid, MAX_WORKGROUPS_PER_DIMENSION } from "../src/engine/dispatch.js";
+import { computeDispatchGrid, MAX_WORKGROUPS_PER_DIMENSION } from "webgpu-compute-kit";
 
 describe("computeDispatchGrid", () => {
   it("stays 1D (y=1) when under the per-dimension limit", () => {

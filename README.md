@@ -1,6 +1,6 @@
 # Kuma — Kernel-Unified Model Artifact
 
-Run a trained PyTorch model **live in your browser**, on the GPU, with no Python server, no ONNX, no runtime dependencies beyond WebGPU.
+Run a trained PyTorch model **live in your browser**, on the GPU, with no Python server and no runtime dependencies beyond WebGPU. (The default path doesn't involve ONNX at all; ONNX is only an optional compile-time route — `backend="onnx"` — plus a separate raw-ONNX package format that kuma-bart runs through onnxruntime-web.)
 
 The idea is simple: take a model you already have, compile it once into a self-contained package, and load that package directly into any browser that supports WebGPU. The package carries everything — the computation graph, the weights, and the WGSL compute shaders to execute it. No server-side inference. No heavyweight runtime. Just a file and a browser.
 
@@ -82,7 +82,7 @@ pip install -e /path/to/kuma
 pip install git+https://github.com/yourorg/kuma.git
 ```
 
-Requires `torch >= 2.1` and `numpy >= 1.24`.
+Requires `torch >= 2.1`, `numpy >= 1.24` and `onnx >= 1.14` (onnx is a hard dependency: the optional ONNX export paths and their golden capture use it).
 
 ### Basic export
 
@@ -133,7 +133,8 @@ package.write_dir("debug/")     # loose files for easier inspection
 
 - Inference only. Static shapes. Float32 only.
 - Raises `ValueError`/`TypeError` loudly on anything outside that: float16, bfloat16, non-CPU tensors, non-`nn.Module` inputs.
-- Op coverage is whatever `torch.export` traces cleanly and kuma-bart has a WGSL kernel for. Conv2d, Linear, BatchNorm, LayerNorm, GroupNorm, GELU, ReLU, SiLU, pooling, upsampling, reshape, permute, concat, slice — all covered. If an op lands in `unsupported_ops` in the manifest, kuma-bart will throw `KumaUnsupportedOpError` at runtime rather than silently producing wrong results.
+- Op coverage on the compiler side is whatever `torch.export` traces cleanly: Conv2d, ConvTranspose2d, Linear, BatchNorm, LayerNorm, GroupNorm, GELU, ReLU, SiLU, pooling, upsampling, reshape, permute, concat, slice all *compile* into a package. Running is a different question — kuma-bart's opRegistry is the authority, and it currently has **no handler for pooling, upsampling, BatchNorm, or transposed convolution** (the WGSL kernels ship in the package, but nothing dispatches them), so a package using those compiles fine and then fails in kuma-bart with `KumaUnsupportedOpError` when loaded/run, rather than silently producing wrong results.
+- The manifest's `unsupported_ops` list is informational only (always empty on the torch path; on the ONNX path it lists ONNX op types that couldn't be converted). kuma-bart does not read it. On the ONNX path, any unconvertible op that's actually reachable from the output is a compile-time `ValueError` instead.
 
 ---
 
@@ -171,7 +172,7 @@ For interactive playback, there's a drop-in web component. Import it once, then 
 
 ```html
 <script type="module">
-  import "kuma-bart"; // registers <kuma-player>
+  import "kuma-bart/player"; // registers <kuma-player>
 </script>
 
 <kuma-player src="/artifacts/model.iph"></kuma-player>
@@ -238,7 +239,7 @@ docker compose run --rm bart-test
 docker compose up bart-demo
 ```
 
-The demo's model picker lists whatever `.iph` files are in `artifacts/`. There are already several models checked in there (`3mbunny.iph`, `3mbeauty.iph`, `3mbosphorus.iph`, `3mhoney.iph`, and the tiny acceptance-test `simple.iph`), so you can spin up `bart-demo` and start poking around without running the export step first.
+The demo's model picker lists whatever `.iph` files are in `artifacts/`. Several models are checked in there (`beauty.iph`, `bosphorus.iph`, `bunny.iph`, `honey.iph`, `jockey.iph`, `ready.iph`, `shake.iph`, `yacht.iph`, their `half*.iph` variants, and the tiny acceptance-test `simple.iph`), so you can spin up `bart-demo` and start poking around without running the export step first.
 
 ---
 
@@ -272,6 +273,12 @@ src/kuma/           Python compiler
   compiler.py         compile(ep) -> Package; the main pipeline
   pack_weights.py     Parameters → contiguous float32 blob
   manifest.py         Manifest dict builder
+  golden.py           golden.json capture (eager-run per-node value stats for verify())
+  branching.py        compile_branching: N traced branches + JS router -> one switch package
+  branch_assembly.py  Router/switch graph + branch namespacing shared by all branching paths
+  onnx_backend.py     export_via_onnx / compile_branching_onnx_kuma: torch -> ONNX -> Kuma graph
+  onnx_ops.py         ONNX op -> aten target converters
+  onnx_compiler.py    compile_onnx / compile_branching_onnx: raw-ONNX packages (onnxruntime-web)
   kernels/            Embedded WGSL shaders (bundled into every .iph)
 
 kuma-bart/          TypeScript WebGPU runtime
@@ -286,5 +293,5 @@ kuma-bart/          TypeScript WebGPU runtime
   test/               vitest unit tests
 
 examples/           Acceptance-test model and export runner
-artifacts/          Output directory (git-ignored) — .iph files land here
+artifacts/          Output directory — NOT git-ignored: the demo .iph models and simple.iph are committed here
 ```

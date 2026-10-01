@@ -1,5 +1,5 @@
 import type { OpContext, ResolvedTensor } from "../engine/context.js";
-import { isNodeRef, type ArgValue, type GraphNode } from "../types/manifest.js";
+import { isNodeRef, nodeRefsIn, type ArgValue, type GraphNode } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
 
@@ -47,17 +47,6 @@ const WEIGHT_ARG_INDEX: Record<string, number> = {
   "aten.mm.default": 1,
   "aten.matmul.default": 1,
 };
-
-function collectNodeRefs(arg: ArgValue, into: Set<string>): void {
-  if (isNodeRef(arg)) {
-    into.add(arg.node_ref);
-    return;
-  }
-  if (Array.isArray(arg)) {
-    for (const a of arg) collectNodeRefs(a, into);
-  }
-}
-
 function tracePassthroughSource(nodesByName: ReadonlyMap<string, GraphNode>, ref: string): string {
   let current = ref;
   const seen = new Set<string>();
@@ -73,26 +62,19 @@ function tracePassthroughSource(nodesByName: ReadonlyMap<string, GraphNode>, ref
 }
 
 /**
- * UNVERIFIED (no Docker access to generate a real Linear-bearing manifest this session
- * — see kuma-bart's plan notes): nn.Linear may decompose to `addmm(bias, x, t(weight))`
- * rather than a fused op, and there is no WGSL kernel for standalone `t`/`transpose`/
- * `permute`. linear.wgsl already expects weight in nn.Linear's native
- * (out_features, in_features) layout and does the transpose arithmetically inside the
- * shader, so when a transpose node's *sole* consumer is an addmm/mm and its own input is
- * a literal weight parameter, we elide the transpose: the matmul binds the original
- * weight buffer directly and the transpose node is never dispatched. Anything else (a
- * transpose used elsewhere, or feeding a non-weight tensor) is left alone and will fail
- * loudly as an unsupported op if actually dispatched, rather than silently mis-executing.
+ * nn.Linear can decompose to `addmm(bias, x, t(weight))` rather than a fused op.
+ * linear.wgsl already expects weight in nn.Linear's native (out_features, in_features)
+ * layout and transposes arithmetically inside the shader, so when a transpose node's
+ * *sole* consumer is an addmm/mm (at its weight position) and its own input traces back
+ * to a weight parameter, the transpose is elided: the matmul binds the original weight
+ * buffer directly and no permute is dispatched. Any other transpose runs normally.
  */
 export function findLinearWeightElisions(nodes: readonly GraphNode[]): Map<string, string> {
   const nodesByName = new Map(nodes.map((n) => [n.name, n]));
   const consumers = new Map<string, GraphNode[]>();
-  const refs = new Set<string>();
 
   for (const n of nodes) {
-    refs.clear();
-    for (const a of n.args) collectNodeRefs(a, refs);
-    for (const v of Object.values(n.kwargs)) collectNodeRefs(v, refs);
+    const refs = new Set(nodeRefsIn([...n.args, ...Object.values(n.kwargs)]));
     for (const ref of refs) {
       const list = consumers.get(ref) ?? [];
       list.push(n);

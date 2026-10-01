@@ -1,4 +1,5 @@
 import { unzipSync } from "fflate";
+import { loadZipPack, PackError, type PackSource, type ZipPack } from "webgpu-compute-kit";
 import type { KumaManifest } from "../types/manifest.js";
 import type { GoldenData } from "../types/golden.js";
 import { KumaManifestError } from "../errors.js";
@@ -16,58 +17,41 @@ export interface IphPackage {
   golden?: GoldenData;
 }
 
-async function toBytes(source: ArrayBuffer | Response | string): Promise<Uint8Array> {
-  if (typeof source === "string") {
-    const res = await fetch(source);
-    if (!res.ok) {
-      throw new KumaManifestError(
-        `Failed to fetch .iph package from "${source}": ${res.status} ${res.statusText}`,
-      );
-    }
-    return new Uint8Array(await res.arrayBuffer());
+/** webgpu-compute-kit's loadZipPack, with its PackErrors surfaced as KumaManifestError. */
+export async function loadIph<M extends { format?: string }>(
+  source: PackSource,
+  expectedFormat?: string,
+): Promise<ZipPack<M>> {
+  try {
+    return await loadZipPack<M>(source, { expectedFormat, what: ".iph package" });
+  } catch (err) {
+    if (err instanceof PackError) throw new KumaManifestError(err.message);
+    throw err;
   }
-  if (source instanceof Response) {
-    if (!source.ok) {
-      throw new KumaManifestError(`Failed to fetch .iph package: ${source.status} ${source.statusText}`);
-    }
-    return new Uint8Array(await source.arrayBuffer());
-  }
-  return new Uint8Array(source);
 }
 
-/** Read the `format` field from a zip's manifest.json without fully parsing the package.
+/** Read the `format` field from a zip's manifest.json, decompressing only that entry.
  * Accepts the already-fetched bytes so the caller doesn't pay for a second fetch. */
 export function peekIphFormat(source: ArrayBuffer | Uint8Array): string | undefined {
   const bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
   let files: Record<string, Uint8Array>;
-  try { files = unzipSync(bytes); } catch { return undefined; }
+  try {
+    files = unzipSync(bytes, { filter: (file) => file.name === "manifest.json" });
+  } catch {
+    return undefined;
+  }
   const manifestBytes = files["manifest.json"];
   if (!manifestBytes) return undefined;
   try {
     const m = JSON.parse(new TextDecoder().decode(manifestBytes)) as { format?: unknown };
     return typeof m.format === "string" ? m.format : undefined;
-  } catch { return undefined; }
+  } catch {
+    return undefined;
+  }
 }
 
 export async function loadIphPackage(source: ArrayBuffer | Response | string): Promise<IphPackage> {
-  const bytes = await toBytes(source);
-
-  let files: Record<string, Uint8Array>;
-  try {
-    files = unzipSync(bytes);
-  } catch (err) {
-    throw new KumaManifestError(`Failed to unzip .iph package: ${(err as Error).message}`);
-  }
-
-  const manifestBytes = files["manifest.json"];
-  if (!manifestBytes) {
-    throw new KumaManifestError('.iph package is missing "manifest.json"');
-  }
-  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as KumaManifest;
-
-  if (manifest.format !== "kuma") {
-    throw new KumaManifestError(`Unrecognized package format "${manifest.format}" (expected "kuma")`);
-  }
+  const { manifest, files } = await loadIph<KumaManifest>(source, "kuma");
 
   const weightFile = manifest.weight_file ?? "weights.f32.bin";
   const weights = files[weightFile];

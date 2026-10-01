@@ -1,4 +1,4 @@
-import { unzipSync } from "fflate";
+import { loadIph } from "../iph/loader.js";
 import type { InferenceSession, Tensor } from "onnxruntime-web";
 import { KumaManifestError } from "../errors.js";
 import type { PlaybackMeta } from "../types/manifest.js";
@@ -54,19 +54,6 @@ function routeFrame(
   return { segId, localNorm };
 }
 
-async function toBytes(source: ArrayBuffer | Response | string): Promise<Uint8Array> {
-  if (typeof source === "string") {
-    const res = await fetch(source);
-    if (!res.ok) throw new KumaManifestError(`Failed to fetch .iph from "${source}": ${res.status} ${res.statusText}`);
-    return new Uint8Array(await res.arrayBuffer());
-  }
-  if (source instanceof Response) {
-    if (!source.ok) throw new KumaManifestError(`Failed to fetch .iph: ${source.status} ${source.statusText}`);
-    return new Uint8Array(await source.arrayBuffer());
-  }
-  return new Uint8Array(source);
-}
-
 /** A loaded ONNX-format `.iph` package, run via onnxruntime-web. */
 export class OnnxModel {
   /** Raw ONNX bytes per segment index — sessions are created lazily on first use. */
@@ -86,8 +73,6 @@ export class OnnxModel {
     this.sessionBytes = sessionBytes;
   }
 
-  /** Pre-compile all segments serially so the WebGPU shader compilation cost is
-   * paid during a known loading phase, not mid-playback. */
   /** Pre-compile all segments serially so the WebGPU shader compilation cost is
    * paid during a known loading phase, not mid-playback.
    *
@@ -133,18 +118,7 @@ export class OnnxModel {
   ): Promise<OnnxModel> {
     await getOrt(); // initialise env (wasmPaths, numThreads) before anything else
 
-    const bytes = await toBytes(source);
-
-    let files: Record<string, Uint8Array>;
-    try {
-      files = unzipSync(bytes);
-    } catch (err) {
-      throw new KumaManifestError(`Failed to unzip .iph: ${(err as Error).message}`);
-    }
-
-    const manifestBytes = files["manifest.json"];
-    if (!manifestBytes) throw new KumaManifestError('.iph is missing "manifest.json"');
-    const raw = JSON.parse(new TextDecoder().decode(manifestBytes)) as { format?: string };
+    const { manifest: raw, files } = await loadIph<{ format?: string }>(source);
 
     if (raw.format !== "onnx" && raw.format !== "onnx-branching") {
       throw new KumaManifestError(

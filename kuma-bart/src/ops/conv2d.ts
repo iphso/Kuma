@@ -3,16 +3,6 @@ import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
 
-// Confirms which conv2d kernel each node actually routes to (verify() passing doesn't
-// prove this -- the general kernel is also correct, so it would pass either way
-// whether or not routing is working). Routing is confirmed correct as of this session
-// (depthwise/pointwise/general all firing as expected) -- this stays off by default
-// since console.log() at up to 13 calls/frame * 60fps has real, unpredictable cost
-// (worse with devtools open) and was directly responsible for an apparently "random"
-// main-thread stall during Play that turned out to just be this. Flip on for any new
-// "is routing actually doing what I think" check, but turn back off afterward.
-const CONV2D_DEBUG_ROUTING = false;
-
 const DEPTHWISE_TILE = 16;
 // Must match conv2d_depthwise.wgsl's PATCH_CAPACITY exactly -- the largest
 // (TILE-1)*stride+k halo patch (in floats) its shared-memory buffer can hold
@@ -169,9 +159,6 @@ function dispatchConv2d(
       groups,
     )
   ) {
-    if (CONV2D_DEBUG_ROUTING) {
-      console.log(`[kuma] conv2d "${node.name}" -> conv2d_depthwise.wgsl (in_ch/grp=1, kh=${kh}, kw=${kw}, stride=${strideH}x${strideW})`);
-    }
     return;
   }
   if (
@@ -197,17 +184,9 @@ function dispatchConv2d(
       groups,
     )
   ) {
-    if (CONV2D_DEBUG_ROUTING) {
-      console.log(`[kuma] conv2d "${node.name}" -> conv2d_pointwise.wgsl tiled GEMM (in_ch=${inChannels}, out_ch=${outChannels})`);
-    }
     return;
   }
 
-  if (CONV2D_DEBUG_ROUTING) {
-    console.log(
-      `[kuma] conv2d "${node.name}" -> conv2d.wgsl (general fallback; in_ch/grp=${inChannelsPerGroup}, kh=${kh}, kw=${kw}, out_ch=${outChannels}, groups=${groups})`,
-    );
-  }
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
   ctx.dispatchKernel("conv2d.wgsl", [input.buffer, weight.buffer, bias.buffer, out, params], numElements(outShape));

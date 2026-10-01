@@ -1,1158 +1,511 @@
-import { describe, expect, it } from "vitest";
-import type { GraphNode, KumaManifest } from "../src/types/manifest.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { KumaManifest } from "../src/types/manifest.js";
 import { runGraph } from "../src/engine/scheduler.js";
+import { profileGraph } from "../src/engine/profile.js";
 import { findLinearWeightElisions } from "../src/ops/linear.js";
 import { KumaUnsupportedOpError } from "../src/errors.js";
-import { BUFFER_POOL_DEPTH, createBufferPoolState, type ResolvedTensor } from "../src/engine/context.js";
+import { BUFFER_POOL_DEPTH, createBufferPoolState } from "../src/engine/context.js";
 import { createMockDevice } from "./mock-gpu.js";
+import { GraphBuilder, fakeKernels, ref, runMock, tensorOn } from "./graph-builder.js";
+
+/** Live (created, never destroyed) non-uniform buffers -- activation memory. Uniform
+ * params buffers persist in constantCache by design. */
+function liveStorage(mock: ReturnType<typeof createMockDevice>): object[] {
+  return [...mock.createdBuffers].filter((b) => !(b.usage & GPUBufferUsage.UNIFORM) && !mock.destroyedBuffers.has(b));
+}
 
 describe("findLinearWeightElisions", () => {
   it("elides a transpose whose sole consumer is addmm and whose input is a weight parameter", () => {
-    const nodes: GraphNode[] = [
-      { id: 0, name: "w", op: "placeholder", target: "w", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "fc.weight" },
-      { id: 1, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "fc.bias" },
-      { id: 2, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: {}, kind: "user_input" },
-      { id: 3, name: "t", op: "call_function", target: "aten.t.default", args: [{ node_ref: "w" }], kwargs: {}, meta: {} },
-      {
-        id: 4,
-        name: "addmm",
-        op: "call_function",
-        target: "aten.addmm.default",
-        args: [{ node_ref: "b" }, { node_ref: "x" }, { node_ref: "t" }],
-        kwargs: {},
-        meta: {},
-      },
-    ];
-    expect(findLinearWeightElisions(nodes).get("t")).toBe("w");
+    const g = new GraphBuilder();
+    const w = g.weight("w", [3, 2]);
+    const b = g.weight("b", [3]);
+    const x = g.input("x", [1, 2]);
+    const t = g.op("t", "aten.t.default", [w]);
+    g.op("addmm", "aten.addmm.default", [b, x, t]);
+    expect(findLinearWeightElisions(g.nodes).get("t")).toBe("w");
   });
 
   it("does not elide a transpose with more than one consumer", () => {
-    const nodes: GraphNode[] = [
-      { id: 0, name: "w", op: "placeholder", target: "w", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "fc.weight" },
-      { id: 1, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: {}, kind: "user_input" },
-      { id: 2, name: "t", op: "call_function", target: "aten.t.default", args: [{ node_ref: "w" }], kwargs: {}, meta: {} },
-      { id: 3, name: "mm1", op: "call_function", target: "aten.mm.default", args: [{ node_ref: "x" }, { node_ref: "t" }], kwargs: {}, meta: {} },
-      { id: 4, name: "mm2", op: "call_function", target: "aten.mm.default", args: [{ node_ref: "x" }, { node_ref: "t" }], kwargs: {}, meta: {} },
-    ];
-    expect(findLinearWeightElisions(nodes).size).toBe(0);
+    const g = new GraphBuilder();
+    const w = g.weight("w", [3, 2]);
+    const x = g.input("x", [1, 2]);
+    const t = g.op("t", "aten.t.default", [w]);
+    g.op("mm1", "aten.mm.default", [x, t]);
+    g.op("mm2", "aten.mm.default", [x, t]);
+    expect(findLinearWeightElisions(g.nodes).size).toBe(0);
   });
 
   it("does not elide a transpose whose input is not a literal weight parameter", () => {
-    const nodes: GraphNode[] = [
-      { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: {}, kind: "user_input" },
-      { id: 1, name: "x2", op: "placeholder", target: "x2", args: [], kwargs: {}, meta: {}, kind: "user_input" },
-      { id: 2, name: "t", op: "call_function", target: "aten.t.default", args: [{ node_ref: "x" }], kwargs: {}, meta: {} },
-      { id: 3, name: "mm", op: "call_function", target: "aten.mm.default", args: [{ node_ref: "x2" }, { node_ref: "t" }], kwargs: {}, meta: {} },
-    ];
-    expect(findLinearWeightElisions(nodes).size).toBe(0);
+    const g = new GraphBuilder();
+    const x = g.input("x", [2, 2]);
+    const x2 = g.input("x2", [2, 2]);
+    const t = g.op("t", "aten.t.default", [x]);
+    g.op("mm", "aten.mm.default", [x2, t]);
+    expect(findLinearWeightElisions(g.nodes).size).toBe(0);
   });
 });
 
-function buildReluManifest(): KumaManifest {
-  return {
-    format: "kuma",
-    format_version: 0,
-    weight_file: "weights.f32.bin",
-    endianness: "little",
-    inputs: [{ name: "x", shape: [4] }],
-    outputs: [{ name: "relu_out", shape: [4] }],
-    weights: [],
-    graph: {
-      node_count: 3,
-      op_counts: { "aten.relu.default": 1 },
-      nodes: [
-        { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-        { id: 1, name: "relu_out", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "x" }], kwargs: {}, meta: { shape: [4] } },
-        { id: 2, name: "output", op: "output", target: "output", args: [[{ node_ref: "relu_out" }]], kwargs: {}, meta: {} },
-      ],
-    },
-    warnings: [],
-    unsupported_ops: [],
-  };
+function reluManifest(): KumaManifest {
+  const g = new GraphBuilder();
+  const x = g.input("x", [4]);
+  return g.output(g.op("relu_out", "aten.relu.default", [x], [4]));
+}
+
+/** z = complex(re, im); combined = op(z, r); out_imag = imag(combined). */
+function complexBinaryManifest(target: string): KumaManifest {
+  const g = new GraphBuilder();
+  const z = g.op("z", "aten.complex.default", [g.input("re", [4]), g.input("im", [4])], [4]);
+  const combined = g.op("combined", target, [z, g.input("r", [4])], [4]);
+  return g.output(g.op("out_imag", "aten.imag.default", [combined], [4]));
+}
+
+function divModeManifest(mode: string, bShape: number[] = [2, 3], b?: number): KumaManifest {
+  const g = new GraphBuilder();
+  const a = g.input("a", [2, 3]);
+  const bArg = b ?? g.input("b", bShape);
+  return g.output(g.op("divided", "aten.div.Tensor_mode", [a, bArg, mode], [2, 3]));
+}
+
+const ROUTE_SNIPPET = "function main(inputs) { const normT = inputs[0]; const segId = normT[0] < 0.5 ? 0 : 1; return [[segId], normT]; }";
+
+function switchManifest(): KumaManifest {
+  const g = new GraphBuilder();
+  const normT = g.input("norm_t", [1]);
+  const route = g.node({ name: "route", op: "js_snippet", target: "route.js", args: [normT], kwargs: {}, meta: { outputs: [{ shape: [1] }, { shape: [1] }] } });
+  const segId = g.op("seg_id", "getitem", [route, 0]);
+  const localVal = g.op("local_val", "getitem", [route, 1]);
+  const branch = (i: number, target: string) => ({
+    inputs: [ref(`b${i}_input`)],
+    output: ref(`b${i}_out`),
+    nodes: [
+      { id: 0, name: `b${i}_input`, op: "placeholder" as const, target: `b${i}_input`, args: [], kwargs: {}, meta: { shape: [1] }, kind: "user_input" as const },
+      { id: 1, name: `b${i}_out`, op: "call_function" as const, target, args: [ref(`b${i}_input`)], kwargs: {}, meta: { shape: [1] } },
+    ],
+  });
+  const switched = g.node({
+    name: "switched",
+    op: "switch",
+    target: "switch",
+    args: [localVal],
+    kwargs: {},
+    meta: { shape: [1] },
+    selector: segId,
+    branches: [branch(0, "aten.relu.default"), branch(1, "aten.gelu.default")],
+  });
+  return g.output(switched);
 }
 
 describe("runGraph (mocked GPUDevice — structural checks only, no real compute)", () => {
   it("resolves a placeholder input through a single op to the output", async () => {
-    const { device } = createMockDevice();
-    const inputBuffer = device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor);
-
-    const outputs = await runGraph({
-      device,
-      manifest: buildReluManifest(),
-      kernels: new Map([["relu.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: inputBuffer, shape: [4] }]]),
-    });
-
+    const { outputs, mock } = await runMock(reluManifest());
     expect(outputs).toHaveLength(1);
     expect(outputs[0]!.name).toBe("relu_out");
     expect(outputs[0]!.shape).toEqual([4]);
     expect(outputs[0]!.data).toHaveLength(4);
+    expect(mock.kernels).toEqual(["relu.wgsl"]);
   });
 
   it("throws KumaUnsupportedOpError for a target with no registered kernel", async () => {
-    const { device } = createMockDevice();
-    const manifest = buildReluManifest();
+    const manifest = reluManifest();
     manifest.graph.nodes[1]!.target = "aten.native_layer_norm.default";
-
-    await expect(
-      runGraph({
-        device,
-        manifest,
-        kernels: new Map(),
-        pipelineCache: new Map(),
-        weightBuffers: new Map(),
-        inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
-      }),
-    ).rejects.toThrow(KumaUnsupportedOpError);
+    await expect(runMock(manifest)).rejects.toThrow(KumaUnsupportedOpError);
   });
 
   it("resolves a multi-output node (chunk) through getitem, dispatching one slice per piece", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4, 3] }],
-      outputs: [
-        { name: "piece0", shape: [2, 3] },
-        { name: "piece1", shape: [2, 3] },
-      ],
-      weights: [],
-      graph: {
-        node_count: 5,
-        op_counts: { "aten.chunk.default": 1, getitem: 2 },
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4, 3] }, kind: "user_input" },
-          {
-            id: 1,
-            name: "chunk",
-            op: "call_function",
-            target: "aten.chunk.default",
-            args: [{ node_ref: "x" }, 2, 0],
-            kwargs: {},
-            meta: { outputs: [{ shape: [2, 3] }, { shape: [2, 3] }] },
-          },
-          { id: 2, name: "piece0", op: "call_function", target: "getitem", args: [{ node_ref: "chunk" }, 0], kwargs: {}, meta: { shape: [2, 3] } },
-          { id: 3, name: "piece1", op: "call_function", target: "getitem", args: [{ node_ref: "chunk" }, 1], kwargs: {}, meta: { shape: [2, 3] } },
-          {
-            id: 4,
-            name: "output",
-            op: "output",
-            target: "output",
-            args: [[{ node_ref: "piece0" }, { node_ref: "piece1" }]],
-            kwargs: {},
-            meta: {},
-          },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["slice.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 48, usage: 0 } as GPUBufferDescriptor), shape: [4, 3] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const chunk = g.op("chunk", "aten.chunk.default", [g.input("x", [4, 3]), 2, 0], undefined, { outputs: [[2, 3], [2, 3]] });
+    const manifest = g.output(g.op("piece0", "getitem", [chunk, 0], [2, 3]), g.op("piece1", "getitem", [chunk, 1], [2, 3]));
+    const { outputs, mock } = await runMock(manifest);
     expect(outputs.map((o) => o.name)).toEqual(["piece0", "piece1"]);
     expect(outputs[0]!.shape).toEqual([2, 3]);
     expect(outputs[1]!.shape).toEqual([2, 3]);
-    // getitem is a pure lookup (no dispatch) — only chunk's 2 slice.wgsl calls dispatch.
-    expect(dispatches).toHaveLength(2);
+    // getitem is a pure lookup — only chunk's two slices dispatch.
+    expect(mock.kernels).toEqual(["slice.wgsl", "slice.wgsl"]);
   });
 
   it("a free passthrough op (alias) dispatches zero kernels", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4] }],
-      outputs: [{ name: "aliased", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 3,
-        op_counts: { "aten.alias.default": 1 },
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "aliased", op: "call_function", target: "aten.alias.default", args: [{ node_ref: "x" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 2, name: "output", op: "output", target: "output", args: [[{ node_ref: "aliased" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map(),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const { outputs, mock } = await runMock(g.output(g.op("aliased", "aten.alias.default", [g.input("x", [4])], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(0);
+    expect(mock.kernels).toEqual([]);
   });
 
   it("low-memory early-free does not destroy a buffer still aliased by a live node (sizeThreshold 0)", async () => {
-    const { device } = createMockDevice();
-    // x → a=relu(x) → { c=alias(a)→e=relu(c),  f=relu(a) }. `c` shares a's buffer; `e`
+    // x → a=relu(x) → { c=alias(a)→e=relu(c), f=relu(a) }. `c` shares a's buffer; `e`
     // (c's last consumer) is encoded before `f` (a's last consumer). A per-name refcount
-    // would free a's buffer when `c` hits 0 at `e`, then `f` would bind a destroyed
-    // buffer. With sizeThreshold 0 every intermediate is early-free-eligible, so this is
-    // exactly the low-memory use-after-destroy. The mock throws if a destroyed buffer is
-    // ever bound, so this passing means the buffer survived until its true last use.
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4] }],
-      outputs: [
-        { name: "e", shape: [4] },
-        { name: "f", shape: [4] },
-      ],
-      weights: [],
-      graph: {
-        node_count: 6,
-        op_counts: { "aten.relu.default": 3, "aten.alias.default": 1 },
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "a", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "x" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 2, name: "c", op: "call_function", target: "aten.alias.default", args: [{ node_ref: "a" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 3, name: "e", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "c" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 4, name: "f", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "a" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 5, name: "output", op: "output", target: "output", args: [[{ node_ref: "e" }, { node_ref: "f" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["relu.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
+    // would free a's buffer at `e`, then `f` would bind a destroyed buffer -- the mock
+    // throws on that, so passing means the buffer survived until its true last use.
+    const g = new GraphBuilder();
+    const a = g.op("a", "aten.relu.default", [g.input("x", [4])], [4]);
+    const c = g.op("c", "aten.alias.default", [a], [4]);
+    const e = g.op("e", "aten.relu.default", [c], [4]);
+    const f = g.op("f", "aten.relu.default", [a], [4]);
+    const { outputs } = await runMock(g.output(e, f), {
       bufferPool: createBufferPoolState({ depth: 1, sizeThreshold: 0 }),
       earlyFreeSubmitBudget: 0, // flush per-buffer so mid-graph early-free is exercised
     });
-
     expect(outputs.map((o) => o.name)).toEqual(["e", "f"]);
   });
 
   it("complex/real pairing round-trips through aten.complex/aten.real with zero dispatch", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "re", shape: [4] },
-        { name: "im", shape: [4] },
-      ],
-      outputs: [{ name: "back_to_real", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 4,
-        op_counts: { "aten.complex.default": 1, "aten.real.default": 1 },
-        nodes: [
-          { id: 0, name: "re", op: "placeholder", target: "re", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "im", op: "placeholder", target: "im", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          {
-            id: 2,
-            name: "z",
-            op: "call_function",
-            target: "aten.complex.default",
-            args: [{ node_ref: "re" }, { node_ref: "im" }],
-            kwargs: {},
-            meta: { shape: [4], dtype: "torch.complex64" },
-          },
-          {
-            id: 3,
-            name: "back_to_real",
-            op: "call_function",
-            target: "aten.real.default",
-            args: [{ node_ref: "z" }],
-            kwargs: {},
-            meta: { shape: [4] },
-          },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "back_to_real" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map(),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([
-        ["re", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-        ["im", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ]),
-    });
-
+    const g = new GraphBuilder();
+    const z = g.op("z", "aten.complex.default", [g.input("re", [4]), g.input("im", [4])], [4]);
+    const { outputs, mock } = await runMock(g.output(g.op("back_to_real", "aten.real.default", [z], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(0);
+    expect(mock.kernels).toEqual([]);
   });
 
-  function buildComplexBinaryManifest(opTarget: string, kernelName: string): KumaManifest {
-    return {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "re", shape: [4] },
-        { name: "im", shape: [4] },
-        { name: "r", shape: [4] },
-      ],
-      outputs: [{ name: "out_imag", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 5,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "re", op: "placeholder", target: "re", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "im", op: "placeholder", target: "im", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 2, name: "r", op: "placeholder", target: "r", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 3, name: "z", op: "call_function", target: "aten.complex.default", args: [{ node_ref: "re" }, { node_ref: "im" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 4, name: "combined", op: "call_function", target: opTarget, args: [{ node_ref: "z" }, { node_ref: "r" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 5, name: "out_imag", op: "call_function", target: "aten.imag.default", args: [{ node_ref: "combined" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 6, name: "output", op: "output", target: "output", args: [[{ node_ref: "out_imag" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-  }
-
-  function complexInputBuffers(device: GPUDevice): Map<string, ResolvedTensor> {
-    return new Map([
-      ["re", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ["im", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ["r", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-    ]);
-  }
-
-  it("aten.mul.Tensor(complex, real) propagates the imaginary part (2 mul.wgsl dispatches)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const outputs = await runGraph({
-      device,
-      manifest: buildComplexBinaryManifest("aten.mul.Tensor", "mul.wgsl"),
-      kernels: new Map([["mul.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: complexInputBuffers(device),
-    });
+  it("aten.mul.Tensor(complex, real) propagates the imaginary part (real mul + imag mul)", async () => {
+    const { outputs, mock } = await runMock(complexBinaryManifest("aten.mul.Tensor"));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(2); // real mul + imag mul
+    expect(mock.kernels).toEqual(["mul.wgsl", "mul.wgsl"]);
   });
 
   it("aten.add.Tensor(complex, real) propagates the imaginary part with zero extra dispatch", async () => {
-    const { device, dispatches } = createMockDevice();
-    const outputs = await runGraph({
-      device,
-      manifest: buildComplexBinaryManifest("aten.add.Tensor", "add.wgsl"),
-      kernels: new Map([["add.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: complexInputBuffers(device),
-    });
+    const { outputs, mock } = await runMock(complexBinaryManifest("aten.add.Tensor"));
     expect(outputs[0]!.shape).toEqual([4]);
-    // 1 dispatch for the real part; out_im = a_im + 0 reuses a's own imag buffer directly.
-    expect(dispatches).toHaveLength(1);
+    // out_im = a_im + 0 reuses a's own imag buffer directly.
+    expect(mock.kernels).toEqual(["add.wgsl"]);
   });
 
-  it("aten.div.Tensor(complex, real) propagates the imaginary part (1 extra div.wgsl)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const outputs = await runGraph({
-      device,
-      manifest: buildComplexBinaryManifest("aten.div.Tensor", "div.wgsl"),
-      kernels: new Map([["div.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: complexInputBuffers(device),
-    });
+  it("aten.div.Tensor(complex, real) propagates the imaginary part (real div + imag div)", async () => {
+    const { outputs, mock } = await runMock(complexBinaryManifest("aten.div.Tensor"));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(2); // real div + imag div
+    expect(mock.kernels).toEqual(["div.wgsl", "div.wgsl"]);
+  });
+
+  it("aten.mul.Tensor(complex, complex) dispatches the full cross-term product", async () => {
+    const g = new GraphBuilder();
+    const z = g.op("z", "aten.complex.default", [g.input("re", [4]), g.input("im", [4])], [4]);
+    const sq = g.op("sq", "aten.mul.Tensor", [z, z], [4]);
+    const { mock } = await runMock(g.output(g.op("out_imag", "aten.imag.default", [sq], [4])));
+    expect(mock.kernels).toEqual(["mul.wgsl", "mul.wgsl", "sub.wgsl", "mul.wgsl", "mul.wgsl", "add.wgsl"]);
   });
 
   it("aten.div.Tensor with a complex denominator fails loudly instead of silently dropping it", async () => {
-    const { device } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "re", shape: [4] },
-        { name: "im", shape: [4] },
-      ],
-      outputs: [{ name: "out", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 4,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "re", op: "placeholder", target: "re", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "im", op: "placeholder", target: "im", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 2, name: "z", op: "call_function", target: "aten.complex.default", args: [{ node_ref: "re" }, { node_ref: "im" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 3, name: "out", op: "call_function", target: "aten.div.Tensor", args: [{ node_ref: "z" }, { node_ref: "z" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "out" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    await expect(
-      runGraph({
-        device,
-        manifest,
-        kernels: new Map([["div.wgsl", "// fake"]]),
-        pipelineCache: new Map(),
-        weightBuffers: new Map(),
-        inputBuffers: new Map([
-          ["re", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-          ["im", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-        ]),
-      }),
-    ).rejects.toThrow(KumaUnsupportedOpError);
+    const g = new GraphBuilder();
+    const z = g.op("z", "aten.complex.default", [g.input("re", [4]), g.input("im", [4])], [4]);
+    await expect(runMock(g.output(g.op("out", "aten.div.Tensor", [z, z], [4])))).rejects.toThrow(KumaUnsupportedOpError);
   });
 
   it("aten.rsub.Scalar negates the imaginary part of a complex input", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "re", shape: [4] },
-        { name: "im", shape: [4] },
-      ],
-      outputs: [{ name: "out_imag", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 5,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "re", op: "placeholder", target: "re", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "im", op: "placeholder", target: "im", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 2, name: "z", op: "call_function", target: "aten.complex.default", args: [{ node_ref: "re" }, { node_ref: "im" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 3, name: "rs", op: "call_function", target: "aten.rsub.Scalar", args: [{ node_ref: "z" }, 1.0], kwargs: {}, meta: { shape: [4] } },
-          { id: 4, name: "out_imag", op: "call_function", target: "aten.imag.default", args: [{ node_ref: "rs" }], kwargs: {}, meta: { shape: [4] } },
-          { id: 5, name: "output", op: "output", target: "output", args: [[{ node_ref: "out_imag" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([
-        ["sub.wgsl", "// fake"],
-        ["neg.wgsl", "// fake"],
-      ]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([
-        ["re", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-        ["im", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ]),
-    });
+    const g = new GraphBuilder();
+    const z = g.op("z", "aten.complex.default", [g.input("re", [4]), g.input("im", [4])], [4]);
+    const rs = g.op("rs", "aten.rsub.Scalar", [z, 1.0], [4]);
+    const { outputs, mock } = await runMock(g.output(g.op("out_imag", "aten.imag.default", [rs], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(2); // sub (real part) + neg (imag part)
+    expect(mock.kernels).toEqual(["sub.wgsl", "neg.wgsl"]);
   });
 
   it("stack of 3 tensors dispatches 2 concat.wgsl calls (N-1 chain, via free unsqueeze)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "a", shape: [2, 3] },
-        { name: "b", shape: [2, 3] },
-        { name: "c", shape: [2, 3] },
-      ],
-      outputs: [{ name: "stacked", shape: [3, 2, 3] }],
-      weights: [],
-      graph: {
-        node_count: 5,
-        op_counts: { "aten.stack.default": 1 },
-        nodes: [
-          { id: 0, name: "a", op: "placeholder", target: "a", args: [], kwargs: {}, meta: { shape: [2, 3] }, kind: "user_input" },
-          { id: 1, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: { shape: [2, 3] }, kind: "user_input" },
-          { id: 2, name: "c", op: "placeholder", target: "c", args: [], kwargs: {}, meta: { shape: [2, 3] }, kind: "user_input" },
-          {
-            id: 3,
-            name: "stacked",
-            op: "call_function",
-            target: "aten.stack.default",
-            args: [[{ node_ref: "a" }, { node_ref: "b" }, { node_ref: "c" }], 0],
-            kwargs: {},
-            meta: { shape: [3, 2, 3] },
-          },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "stacked" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["concat.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([
-        ["a", { buffer: device.createBuffer({ size: 24, usage: 0 } as GPUBufferDescriptor), shape: [2, 3] }],
-        ["b", { buffer: device.createBuffer({ size: 24, usage: 0 } as GPUBufferDescriptor), shape: [2, 3] }],
-        ["c", { buffer: device.createBuffer({ size: 24, usage: 0 } as GPUBufferDescriptor), shape: [2, 3] }],
-      ]),
-    });
-
+    const g = new GraphBuilder();
+    const parts = ["a", "b", "c"].map((n) => g.input(n, [2, 3]));
+    const { outputs, mock } = await runMock(g.output(g.op("stacked", "aten.stack.default", [parts, 0], [3, 2, 3])));
     expect(outputs[0]!.shape).toEqual([3, 2, 3]);
-    expect(dispatches).toHaveLength(2);
+    expect(mock.kernels).toEqual(["concat.wgsl", "concat.wgsl"]);
   });
 
-  function buildDivModeManifest(mode: string): KumaManifest {
-    return {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [
-        { name: "a", shape: [4] },
-        { name: "b", shape: [4] },
-      ],
-      outputs: [{ name: "divided", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 3,
-        op_counts: { "aten.div.Tensor_mode": 1 },
-        nodes: [
-          { id: 0, name: "a", op: "placeholder", target: "a", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          {
-            id: 2,
-            name: "divided",
-            op: "call_function",
-            target: "aten.div.Tensor_mode",
-            args: [{ node_ref: "a" }, { node_ref: "b" }, mode],
-            kwargs: {},
-            meta: { shape: [4] },
-          },
-          { id: 3, name: "output", op: "output", target: "output", args: [[{ node_ref: "divided" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-  }
-
   it('div_mode="floor" dispatches div.wgsl then floor.wgsl', async () => {
-    const { device, dispatches } = createMockDevice();
-    const inputBuffers = new Map([
-      ["a", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ["b", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-    ]);
+    const { outputs, mock } = await runMock(divModeManifest("floor"));
+    expect(outputs[0]!.shape).toEqual([2, 3]);
+    expect(mock.kernels).toEqual(["div.wgsl", "floor.wgsl"]);
+  });
 
-    const outputs = await runGraph({
-      device,
-      manifest: buildDivModeManifest("floor"),
-      kernels: new Map([
-        ["div.wgsl", "// fake"],
-        ["floor.wgsl", "// fake"],
-      ]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers,
-    });
-
-    expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(2);
+  it('div_mode="floor" broadcasts a smaller tensor operand and accepts a scalar one', async () => {
+    const broadcast = await runMock(divModeManifest("floor", [1, 3]));
+    expect(broadcast.mock.kernels).toEqual(["permute.wgsl", "div.wgsl", "floor.wgsl"]);
+    const scalar = await runMock(divModeManifest("floor", [], 2));
+    expect(scalar.mock.kernels).toEqual(["div.wgsl", "floor.wgsl"]);
   });
 
   it("low-memory (sizeThreshold 0) frees op-internal intermediates, not just node outputs", async () => {
-    // floor-div allocates an intra-op `divided` buffer (never setOutput into `resolved`)
-    // plus the node output. At sizeThreshold 0 both bypass the pool and are allocated
-    // fresh. Cleanup scans `resolved`, so without the transient-buffer tracking the
-    // `divided` buffer leaks every call -- the low-memory per-frame OOM. After the run the
-    // only live storage buffer should be the output the caller was handed.
-    const { device, destroyedBuffers, createdBuffers } = createMockDevice();
-    const inputBuffers = new Map([
-      ["a", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ["b", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-    ]);
-
-    const outputs = await runGraph({
-      device,
-      manifest: buildDivModeManifest("floor"),
-      kernels: new Map([
-        ["div.wgsl", "// fake"],
-        ["floor.wgsl", "// fake"],
-      ]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers,
+    // floor-div allocates an intra-op `divided` buffer (never in `resolved`) plus the
+    // node output; at sizeThreshold 0 both are fresh allocations. After the run the only
+    // live storage buffers must be the caller's inputs and the output it was handed --
+    // and releasing the output leaves just the inputs.
+    const { outputs, mock, inputBuffers } = await runMock(divModeManifest("floor"), {
       bufferPool: createBufferPoolState({ depth: 1, sizeThreshold: 0 }),
-      earlyFreeSubmitBudget: 0, // flush per-buffer so mid-graph early-free is exercised
+      earlyFreeSubmitBudget: 0,
     });
-
-    // Uniform (params) buffers are cached in constantCache and persist by design; only
-    // storage buffers are activation memory. The single survivor must be the output.
-    const liveStorage = [...createdBuffers].filter(
-      (b) => !(b.usage & GPUBufferUsage.UNIFORM) && !destroyedBuffers.has(b),
-    );
-    expect(liveStorage).toEqual([outputs[0]!.buffer]);
+    const inputs = [...inputBuffers.values()].map((t) => t.buffer);
+    expect(new Set(liveStorage(mock))).toEqual(new Set([...inputs, outputs[0]!.buffer]));
+    outputs[0]!.release();
+    expect(new Set(liveStorage(mock))).toEqual(new Set(inputs));
   });
 
   it('div_mode="trunc" (unsupported) fails loudly instead of guessing', async () => {
-    const { device } = createMockDevice();
-    const inputBuffers = new Map([
-      ["a", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ["b", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-    ]);
-
-    await expect(
-      runGraph({
-        device,
-        manifest: buildDivModeManifest("trunc"),
-        kernels: new Map(),
-        pipelineCache: new Map(),
-        weightBuffers: new Map(),
-        inputBuffers,
-      }),
-    ).rejects.toThrow(KumaUnsupportedOpError);
+    await expect(runMock(divModeManifest("trunc"))).rejects.toThrow(KumaUnsupportedOpError);
   });
 
-  function buildSwitchManifest(): KumaManifest {
-    return {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "norm_t", shape: [1] }],
-      outputs: [{ name: "result", shape: [1] }],
-      weights: [],
-      graph: {
-        node_count: 6,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "norm_t", op: "placeholder", target: "norm_t", args: [], kwargs: {}, meta: { shape: [1] }, kind: "user_input" },
-          {
-            id: 1,
-            name: "route",
-            op: "js_snippet",
-            target: "route.js",
-            args: [{ node_ref: "norm_t" }],
-            kwargs: {},
-            meta: { outputs: [{ shape: [1] }, { shape: [1] }] },
-          },
-          { id: 2, name: "seg_id", op: "call_function", target: "getitem", args: [{ node_ref: "route" }, 0], kwargs: {}, meta: {} },
-          { id: 3, name: "local_val", op: "call_function", target: "getitem", args: [{ node_ref: "route" }, 1], kwargs: {}, meta: {} },
-          {
-            id: 4,
-            name: "switched",
-            op: "switch",
-            target: "switch",
-            args: [{ node_ref: "local_val" }],
-            kwargs: {},
-            meta: { shape: [1] },
-            selector: { node_ref: "seg_id" },
-            branches: [
-              {
-                inputs: [{ node_ref: "b0_input" }],
-                output: { node_ref: "b0_out" },
-                nodes: [
-                  { id: 0, name: "b0_input", op: "placeholder", target: "b0_input", args: [], kwargs: {}, meta: { shape: [1] }, kind: "user_input" },
-                  { id: 1, name: "b0_out", op: "call_function", target: "aten.relu.default", args: [{ node_ref: "b0_input" }], kwargs: {}, meta: { shape: [1] } },
-                ],
-              },
-              {
-                inputs: [{ node_ref: "b1_input" }],
-                output: { node_ref: "b1_out" },
-                nodes: [
-                  { id: 0, name: "b1_input", op: "placeholder", target: "b1_input", args: [], kwargs: {}, meta: { shape: [1] }, kind: "user_input" },
-                  { id: 1, name: "b1_out", op: "call_function", target: "aten.gelu.default", args: [{ node_ref: "b1_input" }], kwargs: {}, meta: { shape: [1] } },
-                ],
-              },
-            ],
-          },
-          { id: 5, name: "output", op: "output", target: "output", args: [[{ node_ref: "switched" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-  }
-
-  const ROUTE_SNIPPET = "function main(inputs) { const normT = inputs[0]; const segId = normT[0] < 0.5 ? 0 : 1; return [[segId], normT]; }";
-
   it("js_snippet -> getitem -> switch picks exactly one branch (segment 0), dispatching only its kernel", async () => {
-    const { device, dispatches } = createMockDevice();
-    const normT = new Float32Array([0.2]); // routes to branch 0 per ROUTE_SNIPPET
-
-    const outputs = await runGraph({
-      device,
-      manifest: buildSwitchManifest(),
-      kernels: new Map([
-        ["relu.wgsl", "// fake"],
-        ["gelu.wgsl", "// fake"],
-      ]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["norm_t", { buffer: device.createBuffer({ size: 4, usage: 0 } as GPUBufferDescriptor), shape: [1] }]]),
-      rawInputs: new Map([["norm_t", normT]]),
+    const { outputs, mock } = await runMock(switchManifest(), {
+      rawInputs: new Map([["norm_t", new Float32Array([0.2])]]),
       snippets: new Map([["route.js", ROUTE_SNIPPET]]),
-      snippetCache: new Map(),
     });
-
     expect(outputs[0]!.shape).toEqual([1]);
-    // Exactly one kernel ran (branch 0's relu) -- branch 1's gelu never dispatched at all.
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["relu.wgsl"]);
   });
 
   it("...and the other branch (segment 1) when the snippet routes differently", async () => {
-    const { device, dispatches } = createMockDevice();
-    const normT = new Float32Array([0.8]); // routes to branch 1 per ROUTE_SNIPPET
-
-    await runGraph({
-      device,
-      manifest: buildSwitchManifest(),
-      kernels: new Map([
-        ["relu.wgsl", "// fake"],
-        ["gelu.wgsl", "// fake"],
-      ]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["norm_t", { buffer: device.createBuffer({ size: 4, usage: 0 } as GPUBufferDescriptor), shape: [1] }]]),
-      rawInputs: new Map([["norm_t", normT]]),
+    const { mock } = await runMock(switchManifest(), {
+      rawInputs: new Map([["norm_t", new Float32Array([0.8])]]),
       snippets: new Map([["route.js", ROUTE_SNIPPET]]),
-      snippetCache: new Map(),
     });
+    expect(mock.kernels).toEqual(["gelu_erf.wgsl"]);
+  });
 
-    expect(dispatches).toHaveLength(1);
+  it("switch-seeded branch inputs are freed by runGraph (it allocated them)", async () => {
+    const { mock, inputBuffers, outputs } = await runMock(switchManifest(), {
+      rawInputs: new Map([["norm_t", new Float32Array([0.2])]]),
+      snippets: new Map([["route.js", ROUTE_SNIPPET]]),
+    });
+    releaseAll(outputs);
+    const callerInputs = [...inputBuffers.values()].map((t) => t.buffer);
+    // The pooled relu output stays (pool ring); the uploaded seed is gone.
+    const live = liveStorage(mock).filter((b) => !callerInputs.includes(b as GPUBuffer));
+    expect(live).toEqual([outputs[0]!.buffer]);
   });
 
   it("aten.mul.Tensor tolerates a literal scalar second operand (not just tensor refs)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4] }],
-      outputs: [{ name: "scaled", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 3,
-        op_counts: { "aten.mul.Tensor": 1 },
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "scaled", op: "call_function", target: "aten.mul.Tensor", args: [{ node_ref: "x" }, 32], kwargs: {}, meta: { shape: [4] } },
-          { id: 2, name: "output", op: "output", target: "output", args: [[{ node_ref: "scaled" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["mul.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const { outputs, mock } = await runMock(g.output(g.op("scaled", "aten.mul.Tensor", [g.input("x", [4]), 32], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["mul.wgsl"]);
   });
 
   it("aten.rsub.Scalar (scalar - tensor) dispatches sub.wgsl with a broadcast constant", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4] }],
-      outputs: [{ name: "result", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 3,
-        op_counts: { "aten.rsub.Scalar": 1 },
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "result", op: "call_function", target: "aten.rsub.Scalar", args: [{ node_ref: "x" }, 1.0], kwargs: {}, meta: { shape: [4] } },
-          { id: 2, name: "output", op: "output", target: "output", args: [[{ node_ref: "result" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["sub.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const { outputs, mock } = await runMock(g.output(g.op("result", "aten.rsub.Scalar", [g.input("x", [4]), 1.0], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["sub.wgsl"]);
+  });
+
+  it("literal-operand constants are keyed by element count, not node name alone", async () => {
+    const constantCache = new Map<string, GPUBuffer>();
+    for (const n of [4, 8]) {
+      const g = new GraphBuilder();
+      const x = g.input("x", [n]);
+      await runMock(g.output(g.op("result", "aten.rsub.Scalar", [x, 1.0], [n]), g.op("scaled", "aten.mul.Tensor", [x, 2], [n])), { constantCache });
+    }
+    const constantKeys = [...constantCache.keys()].filter((k) => !k.startsWith("params:")).sort();
+    expect(constantKeys).toEqual(["operand:scaled:b:4", "operand:scaled:b:8", "rsub:result:4", "rsub:result:8"]);
   });
 
   it("aten.rsub.Scalar with alpha != 1 fails loudly instead of computing the wrong thing", async () => {
-    const { device } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [4] }],
-      outputs: [{ name: "result", shape: [4] }],
-      weights: [],
-      graph: {
-        node_count: 3,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [4] }, kind: "user_input" },
-          { id: 1, name: "result", op: "call_function", target: "aten.rsub.Scalar", args: [{ node_ref: "x" }, 1.0, 2.0], kwargs: {}, meta: { shape: [4] } },
-          { id: 2, name: "output", op: "output", target: "output", args: [[{ node_ref: "result" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    await expect(
-      runGraph({
-        device,
-        manifest,
-        kernels: new Map(),
-        pipelineCache: new Map(),
-        weightBuffers: new Map(),
-        inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]),
-      }),
-    ).rejects.toThrow(KumaUnsupportedOpError);
+    const g = new GraphBuilder();
+    const manifest = g.output(g.op("result", "aten.rsub.Scalar", [g.input("x", [4]), 1.0, 2.0], [4]));
+    await expect(runMock(manifest)).rejects.toThrow(KumaUnsupportedOpError);
   });
 
   it("aten.conv2d.default with the bare 3-arg form (stride/padding/dilation/groups omitted at their defaults)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [1, 3, 4, 4] }],
-      outputs: [{ name: "y", shape: [1, 2, 4, 4] }],
-      weights: [
-        { name: "w", shape: [2, 3, 3, 3], dtype: "float32", n_elements: 54, byte_offset: 0, byte_length: 216 },
-        { name: "b", shape: [2], dtype: "float32", n_elements: 2, byte_offset: 216, byte_length: 8 },
-      ],
-      graph: {
-        node_count: 5,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [1, 3, 4, 4] }, kind: "user_input" },
-          { id: 1, name: "w", op: "placeholder", target: "w", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "w" },
-          { id: 2, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "b" },
-          {
-            id: 3,
-            name: "y",
-            op: "call_function",
-            target: "aten.conv2d.default",
-            // bare 3-arg form, exactly as observed in the real exported model
-            args: [{ node_ref: "x" }, { node_ref: "w" }, { node_ref: "b" }],
-            kwargs: {},
-            meta: { shape: [1, 2, 4, 4] },
-          },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "y" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["conv2d.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map([
-        ["w", { buffer: device.createBuffer({ size: 216, usage: 0 } as GPUBufferDescriptor), shape: [2, 3, 3, 3] }],
-        ["b", { buffer: device.createBuffer({ size: 8, usage: 0 } as GPUBufferDescriptor), shape: [2] }],
-      ]),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 192, usage: 0 } as GPUBufferDescriptor), shape: [1, 3, 4, 4] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const args = [g.input("x", [1, 3, 4, 4]), g.weight("w", [2, 3, 3, 3]), g.weight("b", [2])];
+    const { outputs, mock } = await runMock(g.output(g.op("y", "aten.conv2d.default", args, [1, 2, 4, 4])));
     expect(outputs[0]!.shape).toEqual([1, 2, 4, 4]);
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["conv2d.wgsl"]);
   });
 
   it("aten.group_norm.default with the 4-arg form (eps omitted at its default)", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [1, 4, 2, 2] }],
-      outputs: [{ name: "y", shape: [1, 4, 2, 2] }],
-      weights: [
-        { name: "w", shape: [4], dtype: "float32", n_elements: 4, byte_offset: 0, byte_length: 16 },
-        { name: "b", shape: [4], dtype: "float32", n_elements: 4, byte_offset: 16, byte_length: 16 },
-      ],
-      graph: {
-        node_count: 5,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [1, 4, 2, 2] }, kind: "user_input" },
-          { id: 1, name: "w", op: "placeholder", target: "w", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "w" },
-          { id: 2, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "b" },
-          {
-            id: 3,
-            name: "y",
-            op: "call_function",
-            target: "aten.group_norm.default",
-            // 4-arg form, exactly as observed in the real exported model (eps omitted)
-            args: [{ node_ref: "x" }, 2, { node_ref: "w" }, { node_ref: "b" }],
-            kwargs: {},
-            meta: { shape: [1, 4, 2, 2] },
-          },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "y" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["groupnorm.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map([
-        ["w", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-        ["b", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }],
-      ]),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 64, usage: 0 } as GPUBufferDescriptor), shape: [1, 4, 2, 2] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const args = [g.input("x", [1, 4, 2, 2]), 2, g.weight("w", [4]), g.weight("b", [4])];
+    const { outputs, mock } = await runMock(g.output(g.op("y", "aten.group_norm.default", args, [1, 4, 2, 2])));
     expect(outputs[0]!.shape).toEqual([1, 4, 2, 2]);
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["groupnorm.wgsl"]);
   });
 
   it("aten.linear.default applied channel-last to a 4D input (e.g. nn.Linear over [B,H,W,C])", async () => {
-    const { device, dispatches } = createMockDevice();
-    const manifest: KumaManifest = {
-      format: "kuma",
-      format_version: 0,
-      weight_file: "weights.f32.bin",
-      endianness: "little",
-      inputs: [{ name: "x", shape: [1, 3, 2, 4] }],
-      outputs: [{ name: "y", shape: [1, 3, 2, 5] }],
-      weights: [
-        { name: "w", shape: [5, 4], dtype: "float32", n_elements: 20, byte_offset: 0, byte_length: 80 },
-        { name: "b", shape: [5], dtype: "float32", n_elements: 5, byte_offset: 80, byte_length: 20 },
-      ],
-      graph: {
-        node_count: 5,
-        op_counts: {},
-        nodes: [
-          { id: 0, name: "x", op: "placeholder", target: "x", args: [], kwargs: {}, meta: { shape: [1, 3, 2, 4] }, kind: "user_input" },
-          { id: 1, name: "w", op: "placeholder", target: "w", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "w" },
-          { id: 2, name: "b", op: "placeholder", target: "b", args: [], kwargs: {}, meta: {}, kind: "parameter", weight_name: "b" },
-          {
-            id: 3,
-            name: "y",
-            op: "call_function",
-            target: "aten.linear.default",
-            // x is 4D (channel-last); only the last dim (4) contracts against weight's K.
-            args: [{ node_ref: "x" }, { node_ref: "w" }, { node_ref: "b" }],
-            kwargs: {},
-            meta: { shape: [1, 3, 2, 5] },
-          },
-          { id: 4, name: "output", op: "output", target: "output", args: [[{ node_ref: "y" }]], kwargs: {}, meta: {} },
-        ],
-      },
-      warnings: [],
-      unsupported_ops: [],
-    };
-
-    const outputs = await runGraph({
-      device,
-      manifest,
-      kernels: new Map([["linear.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map([
-        ["w", { buffer: device.createBuffer({ size: 80, usage: 0 } as GPUBufferDescriptor), shape: [5, 4] }],
-        ["b", { buffer: device.createBuffer({ size: 20, usage: 0 } as GPUBufferDescriptor), shape: [5] }],
-      ]),
-      inputBuffers: new Map([["x", { buffer: device.createBuffer({ size: 96, usage: 0 } as GPUBufferDescriptor), shape: [1, 3, 2, 4] }]]),
-    });
-
+    const g = new GraphBuilder();
+    const args = [g.input("x", [1, 3, 2, 4]), g.weight("w", [5, 4]), g.weight("b", [5])];
+    const { outputs, mock } = await runMock(g.output(g.op("y", "aten.linear.default", args, [1, 3, 2, 5])));
     // leading dims [1,3,2] preserved, only the last dim (4 -> 5) changes.
     expect(outputs[0]!.shape).toEqual([1, 3, 2, 5]);
-    expect(dispatches).toHaveLength(1);
+    expect(mock.kernels).toEqual(["linear.wgsl"]);
+  });
+});
+
+describe("unary elementwise ops", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    ["aten.sigmoid.default", "sigmoid.wgsl"],
+    ["aten.tanh.default", "tanh.wgsl"],
+    ["aten.silu.default", "silu.wgsl"],
+    ["aten.abs.default", "abs.wgsl"],
+    ["aten.exp.default", "exp.wgsl"],
+    ["aten.log.default", "log.wgsl"],
+    ["aten.rsqrt.default", "rsqrt.wgsl"],
+    ["aten.hardswish.default", "hardswish.wgsl"],
+  ])("%s dispatches %s", async (target, kernel) => {
+    const g = new GraphBuilder();
+    const { outputs, mock } = await runMock(g.output(g.op("y", target, [g.input("x", [2, 3])], [2, 3])));
+    expect(outputs[0]!.shape).toEqual([2, 3]);
+    expect(mock.kernels).toEqual([kernel]);
+  });
+
+  function geluManifest(kwargs: Record<string, string> = {}): KumaManifest {
+    const g = new GraphBuilder();
+    return g.output(g.op("y", "aten.gelu.default", [g.input("x", [4])], [4], { kwargs }));
+  }
+
+  it("aten.gelu.default runs exact erf GELU (gelu_erf.wgsl) by default", async () => {
+    expect((await runMock(geluManifest())).mock.kernels).toEqual(["gelu_erf.wgsl"]);
+    expect((await runMock(geluManifest({ approximate: "none" }))).mock.kernels).toEqual(["gelu_erf.wgsl"]);
+  });
+
+  it('aten.gelu.default with approximate="tanh" runs gelu.wgsl', async () => {
+    expect((await runMock(geluManifest({ approximate: "tanh" }))).mock.kernels).toEqual(["gelu.wgsl"]);
+  });
+
+  it("aten.gelu.default falls back to gelu.wgsl, warning once, for packages without gelu_erf.wgsl", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const first = await runMock(geluManifest(), { missingKernels: ["gelu_erf.wgsl"] });
+    const second = await runMock(geluManifest(), { missingKernels: ["gelu_erf.wgsl"] });
+    expect(first.mock.kernels).toEqual(["gelu.wgsl"]);
+    expect(second.mock.kernels).toEqual(["gelu.wgsl"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+});
+
+function releaseAll(outputs: { release(): void }[]): void {
+  for (const o of outputs) o.release();
+}
+
+describe("buffer ownership", () => {
+  it("runGraph never destroys caller-provided inputs, so one input buffer can serve many calls", async () => {
+    const mock = createMockDevice();
+    const inputBuffers = new Map([["x", tensorOn(mock.device, [4])]]);
+    const bufferPool = createBufferPoolState({ sizeThreshold: 0 });
+    for (let i = 0; i < 3; i++) {
+      const { outputs } = await runMock(reluManifest(), { mock, inputBuffers, bufferPool });
+      releaseAll(outputs);
+    }
+    expect(mock.destroyedBuffers.has(inputBuffers.get("x")!.buffer)).toBe(false);
+  });
+
+  it("release() destroys a fresh (non-pooled) output, and is a no-op for pooled ones", async () => {
+    const fresh = await runMock(reluManifest(), { bufferPool: createBufferPoolState({ sizeThreshold: 0 }) });
+    fresh.outputs[0]!.release();
+    expect(fresh.mock.destroyedBuffers.has(fresh.outputs[0]!.buffer)).toBe(true);
+
+    const pooled = await runMock(reluManifest(), { bufferPool: createBufferPoolState() });
+    pooled.outputs[0]!.release();
+    expect(pooled.mock.destroyedBuffers.has(pooled.outputs[0]!.buffer)).toBe(false);
+  });
+
+  it("release() on an output that aliases a caller input leaves the input alone", async () => {
+    const g = new GraphBuilder();
+    const manifest = g.output(g.op("aliased", "aten.alias.default", [g.input("x", [4])], [4]));
+    const { outputs, mock, inputBuffers } = await runMock(manifest, { bufferPool: createBufferPoolState({ sizeThreshold: 0 }) });
+    outputs[0]!.release();
+    expect(mock.destroyedBuffers.has(inputBuffers.get("x")!.buffer)).toBe(false);
+  });
+
+  it("early-free never destroys a synthesized weight, even on the cold call that creates it", async () => {
+    // The weight is rebuilt by synthetic_weights.ts (not in weights[]) and cached in
+    // constantCache *during* this call; its only consumer drops its refcount to zero.
+    const g = new GraphBuilder();
+    const w = g.weight("layer.complex_tucker.lifted_tensor_0", [4, 4], false);
+    const manifest = g.output(g.op("y", "aten.relu.default", [w], [4, 4]));
+    const constantCache = new Map<string, GPUBuffer>();
+    const { mock } = await runMock(manifest, {
+      constantCache,
+      bufferPool: createBufferPoolState({ depth: 1, sizeThreshold: 0 }),
+      earlyFreeSubmitBudget: 0,
+    });
+    const synthesized = constantCache.get("layer.complex_tucker.lifted_tensor_0");
+    expect(synthesized).toBeDefined();
+    expect(mock.destroyedBuffers.has(synthesized!)).toBe(false);
+  });
+});
+
+describe("profileGraph", () => {
+  it("times every dispatching node through the same encode path as runGraph, freeing its own buffers", async () => {
+    const mock = createMockDevice({ features: ["timestamp-query"] });
+    const g = new GraphBuilder();
+    const a = g.op("a", "aten.relu.default", [g.input("x", [4])], [4]);
+    const c = g.op("c", "aten.alias.default", [a], [4]);
+    const manifest = g.output(g.op("e", "aten.sigmoid.default", [c], [4]));
+    const inputBuffers = new Map([["x", tensorOn(mock.device, [4])]]);
+    const report = await profileGraph({
+      device: mock.device,
+      manifest,
+      kernels: fakeKernels(),
+      pipelineCache: new Map(),
+      weightBuffers: new Map(),
+      inputBuffers,
+      bufferPool: createBufferPoolState({ sizeThreshold: 0 }),
+    });
+    expect(report.perNode.map((t) => t.name)).toEqual(["a", "c", "e"]);
+    expect(mock.kernels).toEqual(["relu.wgsl", "sigmoid.wgsl"]);
+    const live = liveStorage(mock).filter((b) => (b as { usage: number }).usage & GPUBufferUsage.STORAGE);
+    expect(live).toEqual([inputBuffers.get("x")!.buffer]);
   });
 });
 
 describe("runGraph buffer pooling (BufferPoolState — see engine/context.ts)", () => {
-  function inputBuffersFor(device: GPUDevice): Map<string, ResolvedTensor> {
-    return new Map([["x", { buffer: device.createBuffer({ size: 16, usage: 0 } as GPUBufferDescriptor), shape: [4] }]]);
-  }
-
   it("without a shared bufferPool (the default), repeated calls never alias each other's buffers", async () => {
-    const { device } = createMockDevice();
-    const manifest = buildReluManifest();
-    const params = {
-      device,
-      manifest,
-      kernels: new Map([["relu.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-    };
-
-    // Fresh input buffer per call, as model.ts does in production (it uploads inputs each
-    // frame) -- runGraph destroys input buffers in its end-of-call cleanup, so reusing one
-    // object across calls would bind a destroyed buffer.
-    const first = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
-    const second = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
-
-    expect(first[0]!.buffer).not.toBe(second[0]!.buffer);
+    const mock = createMockDevice();
+    const first = await runMock(reluManifest(), { mock });
+    const second = await runMock(reluManifest(), { mock });
+    expect(first.outputs[0]!.buffer).not.toBe(second.outputs[0]!.buffer);
   });
 
   it("with a shared bufferPool, a node's output buffer is reused exactly every BUFFER_POOL_DEPTH calls", async () => {
-    const { device } = createMockDevice();
-    const manifest = buildReluManifest();
+    const mock = createMockDevice();
     const bufferPool = createBufferPoolState();
-    const params = {
-      device,
-      manifest,
-      kernels: new Map([["relu.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      bufferPool,
-    };
-
-    // Sequential (awaited one at a time) calls, BUFFER_POOL_DEPTH + 2 of them, so the
-    // ring wraps around at least once. Fresh input buffer per call (see note above) --
-    // runGraph destroys inputs in cleanup, so they can't be shared across calls.
+    // Sequential calls, BUFFER_POOL_DEPTH + 2 of them, so the ring wraps at least once.
     const buffers: GPUBuffer[] = [];
     for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
-      const outputs = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
+      const { outputs } = await runMock(reluManifest(), { mock, bufferPool });
       buffers.push(outputs[0]!.buffer);
     }
-
     // Generation N and generation N + BUFFER_POOL_DEPTH land on the same ring slot.
     expect(buffers[BUFFER_POOL_DEPTH]).toBe(buffers[0]);
     expect(buffers[BUFFER_POOL_DEPTH + 1]).toBe(buffers[1]);
     // Every other pair within one rotation is a genuinely distinct buffer.
-    for (let i = 0; i < BUFFER_POOL_DEPTH; i++) {
-      for (let j = i + 1; j < BUFFER_POOL_DEPTH; j++) {
-        expect(buffers[i]).not.toBe(buffers[j]);
-      }
-    }
+    expect(new Set(buffers.slice(0, BUFFER_POOL_DEPTH)).size).toBe(BUFFER_POOL_DEPTH);
   });
 
-  it("pooled buffers are never destroyed by runGraph's own end-of-call cleanup", async () => {
-    const { device, destroyedBuffers } = createMockDevice();
-    const manifest = buildReluManifest();
+  it("pooled buffers are never destroyed, by runGraph's cleanup or by release()", async () => {
+    const mock = createMockDevice();
     const bufferPool = createBufferPoolState();
-    const params = {
-      device,
-      manifest,
-      kernels: new Map([["relu.wgsl", "// fake"]]),
-      pipelineCache: new Map(),
-      weightBuffers: new Map(),
-      bufferPool,
-    };
-
-    // Fresh input buffer per call (see note above) -- runGraph destroys inputs in cleanup.
     const seenBuffers = new Set<GPUBuffer>();
     for (let i = 0; i < BUFFER_POOL_DEPTH + 2; i++) {
-      const outputs = await runGraph({ ...params, inputBuffers: inputBuffersFor(device) });
+      const { outputs } = await runMock(reluManifest(), { mock, bufferPool });
       seenBuffers.add(outputs[0]!.buffer);
+      releaseAll(outputs);
     }
-
     for (const buffer of seenBuffers) {
-      expect(destroyedBuffers.has(buffer as unknown as object)).toBe(false);
+      expect(mock.destroyedBuffers.has(buffer)).toBe(false);
     }
   });
 
   it("concurrent (not individually-awaited) calls sharing a pool never lose or double-assign a generation", async () => {
-    // Mirrors how demo/main.ts actually drives this: multiple runToGpu() calls fired
-    // without awaiting each one first, relying on acquireGenerationSlot/
-    // releaseGenerationSlot (engine/context.ts) to keep concurrent calls safe. This is
-    // the scenario where a subtle off-by-one or a missed atomicity guarantee in the
-    // generation-counter scheme would actually show up -- a purely sequential,
-    // one-call-at-a-time test (the test above) can't exercise this at all, since by
-    // the time call N starts, call N-1's pool slot has always long since been
-    // confirmed free.
-    //
-    // Deliberately *not* assuming array index == assigned generation order below: when
-    // every call is fired in the same synchronous loop before any of them has reached
-    // its own await, which one's continuation actually runs first is a microtask-
-    // scheduling detail, not something this test can or should pin down. The
-    // invariants checked here hold regardless of that order.
-    const { device } = createMockDevice();
-    const manifest = buildReluManifest();
+    // Mirrors KumaPlayer firing several runToGpu() calls without awaiting each, relying on
+    // acquireGenerationSlot/releaseGenerationSlot to keep them safe -- the scenario where
+    // an off-by-one or lost update in the generation counter would show up. Doesn't
+    // assume array index == assigned generation (microtask order isn't pinned down).
+    const mock = createMockDevice();
     const bufferPool = createBufferPoolState();
     const callCount = BUFFER_POOL_DEPTH + 2;
-
+    const manifest = reluManifest();
     const results = await Promise.all(
       Array.from({ length: callCount }, () =>
         runGraph({
-          device,
+          device: mock.device,
           manifest,
-          kernels: new Map([["relu.wgsl", "// fake"]]),
+          kernels: fakeKernels(),
           pipelineCache: new Map(),
           weightBuffers: new Map(),
-          inputBuffers: inputBuffersFor(device),
+          inputBuffers: new Map([["x", tensorOn(mock.device, [4])]]),
           bufferPool,
         }),
       ),
     );
-
-    // Every call must have advanced callGeneration exactly once -- a lost update
-    // (two concurrent calls both reading the same stale value) would leave this short
-    // of callCount; a double-increment would overshoot it.
+    // Every call advanced callGeneration exactly once.
     expect(bufferPool.callGeneration).toBe(callCount);
-
-    // The pool must have rotated through exactly BUFFER_POOL_DEPTH distinct buffers
-    // across all callCount calls -- not fewer (which would mean two different
-    // generations incorrectly collided on one slot) and not more (which would mean
-    // the ring didn't actually wrap around / pool to begin with).
+    // Exactly BUFFER_POOL_DEPTH distinct buffers across all calls: fewer means two
+    // generations collided on one slot; more means the ring didn't wrap.
     const distinctBuffers = new Set(results.map((outputs) => outputs[0]!.buffer));
     expect(distinctBuffers.size).toBe(Math.min(callCount, BUFFER_POOL_DEPTH));
   });
