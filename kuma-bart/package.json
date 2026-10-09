@@ -20,6 +20,7 @@
     "typecheck": "tsc --noEmit",
     "build": "vite build",
     "test": "npm run typecheck && vitest run",
+    "test:gpu": "vitest run --config vitest.gpu.config.ts",
     "demo": "vite --host 0.0.0.0 --config vite.demo.config.ts"
   },
   "dependencies": {
