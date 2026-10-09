@@ -18,7 +18,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "vite build",
+    "build": "vite build && tsc -p tsconfig.build.json",
     "test": "npm run typecheck && vitest run",
     "demo": "vite --host 0.0.0.0 --config vite.demo.config.ts",
     "test:gpu": "vitest run --config vitest.gpu.config.ts"
