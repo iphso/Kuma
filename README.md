@@ -166,6 +166,33 @@ const profile = await model.profile({ time: new Float32Array([0.5]) });
 
 `KumaModel.load` accepts a path string, a `Response`, or an `ArrayBuffer` — so it works equally well fetching from a server or reading a file the user dropped into the page.
 
+### Shared-device mode: GPU-resident inputs and outputs
+
+By default each `load()` requests its own `GPUDevice`. WebGPU resources are device-scoped, so a model on its own device can't read a buffer your simulation wrote, and your kernels can't read its outputs. Pass your device instead, and record the model into your own command encoder:
+
+```ts
+import { requestComputeDevice, uploadFloat32 } from "webgpu-compute-kit";
+import { KumaModel, type GpuTensor } from "kuma-bart";
+
+const { device } = await requestComputeDevice();
+const model = await KumaModel.load("/path/to/denoiser.iph", { device }); // never destroys `device`
+
+const encoder = device.createCommandEncoder();
+// ... your kernels that assemble noise + conditioning into `noisy` (a GpuTensor) ...
+const run = model.encode(new Map([["x", noisy]]), encoder); // synchronous, nothing submitted
+// ... your kernels that consume run.outputs[0] (or run.outputsByName.get("out")) ...
+const next = model.encode(new Map([["x", other]]), encoder);  // as many as you like per encoder
+device.queue.submit([encoder.finish()]);
+run.release();  // after submit: hands the encode's scratch back for reuse
+next.release();
+```
+
+`GpuTensor` is `{ buffer: GPUBuffer, shape: readonly number[], dtype: "f32", byteOffset?: number }`. The layout is the `.iph` layout everywhere: contiguous, row-major (last dimension fastest), little-endian float32, and NCHW for 4-D activations — `[batch, channels, height, width]`, element `(n, c, y, x)` at float index `((n*C + c)*H + y)*W + x`. An input at a non-zero `byteOffset` is staged by one GPU copy (it needs `COPY_SRC` usage; offset-0 inputs are bound directly and need `STORAGE`). Pass `{ outputs: new Map([[name, tensor]]) }` to have an output copied into your own buffer (at its `byteOffset`, `COPY_DST`) instead of handed back as scratch — that's how N windows go side by side into one buffer in one submission.
+
+Rules: inputs must match the manifest's names and declared shapes (`KumaShapeError` on a mismatch, `KumaManifestError` if one is missing) and must be buffers of `model.gpuDevice` — WebGPU gives no way to ask a buffer which device it belongs to, so a foreign buffer surfaces as an asynchronous WebGPU validation error, not a JS throw. Scratch outputs are valid until `release()`; call it once the encoder is submitted (or dropped) and everything that reads them has been recorded. Every `encode()` holds its own scratch set, so concurrent encodes never alias; sets are kept for reuse, and `model.trimScratch()` frees the ones a one-off burst left behind. Switch-routed packages (multi-segment exports) route on the CPU, so they also need `{ rawInputs }` with the routing inputs' values.
+
+`run()`, `runRaw()` and `runToGpu()` are the same path with CPU inputs uploaded for you and one submit per call.
+
 ### `<kuma-player>` web component
 
 For interactive playback, there's a drop-in web component. Import it once, then use the element anywhere:
@@ -249,7 +276,7 @@ The demo's model picker lists whatever `.iph` files are in `artifacts/`. Several
 
 Without pooling, a real model (~270 dispatched nodes) allocates and immediately destroys hundreds of `GPUBuffer`/bind-group/uniform-buffer objects every frame at 60fps. That's enough sustained pressure to trigger real V8 GC pauses — confirmed with Chrome DevTools Performance recordings where GC surges landed exactly where frame drops appeared.
 
-The fix: every node's output comes from a small ring of pre-allocated GPU buffers (`BUFFER_POOL_DEPTH` deep), reused on every call. This works because kuma is a **static-shape** compiler — the same node always produces the same shape, so the same buffer is always the right size. A generation counter tracks which slots are still in use under multi-frame pipelining, so a buffer is never handed out again until the GPU confirms the previous frame using it has completed.
+The fix: no per-frame allocation. `run()`/`encode()` draw every intermediate from a *scratch set* held by that one call: a free list keyed by buffer size that recycles a buffer as soon as its last consumer is recorded (kuma is a **static-shape** compiler, so sizes repeat), and that goes back to the model on `release()` for the next call to reuse whole. A call in flight owns its set outright, so any number of calls can be recorded into one encoder before submission without sharing a buffer; `maxInFlight` is the recommended number to keep in flight, since each one holds a live activation set. `verify()`/`profile()` still use the older per-node ring (`BUFFER_POOL_DEPTH` deep, generation-counted across submissions).
 
 ### The ~30ms GPU-completion latency problem
 
@@ -283,14 +310,15 @@ src/kuma/           Python compiler
 
 kuma-bart/          TypeScript WebGPU runtime
   src/
-    model.ts          KumaModel: load, run, runToGpu, verify, profile, warmUp
+    model.ts          KumaModel: load (own or shared device), encode, run, runToGpu, verify, profile, warmUp
     player/
       KumaPlayer.ts   <kuma-player> web component
-    engine/           Interpreter loop, buffer pooling, profiler, verifier
+    engine/           Interpreter loop, scratch sets / buffer pooling, profiler, verifier
     ops/              One file per op family (conv, linear, norm, activation, ...)
-    gpu/              Device init, buffer helpers, params packing
+    gpu/              Params packing (device/buffer plumbing lives in webgpu-compute-kit)
+    types/            manifest.json / golden.json types, the GpuTensor contract
   demo/               Interactive browser demo
-  test/               vitest unit tests
+  test/               vitest unit tests on a mock GPU; test/gpu/ runs on a real GPU (Dawn in Node)
 
 examples/           Acceptance-test model and export runner
 artifacts/          Output directory — NOT git-ignored: the demo .iph models and simple.iph are committed here
