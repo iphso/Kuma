@@ -41,6 +41,7 @@ _KERNEL_NAMES: tuple[str, ...] = (
     # reductions
     "mean.wgsl",
     "sum.wgsl",
+    "softmax.wgsl",
     # gather / indexing
     "gather.wgsl",
     "gather_dim.wgsl",

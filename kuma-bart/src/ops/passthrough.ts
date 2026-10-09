@@ -1,4 +1,5 @@
 import type { OpContext, OpHandler } from "../engine/context.js";
+import { numElements } from "../engine/shape.js";
 
 /** Metadata-only passthrough: same buffer, shape taken straight from this node's own
  * (authoritative) manifest meta — no kernel dispatch. Covers aten.alias.default,
@@ -21,4 +22,16 @@ export const zerosLikeHandler: OpHandler = (ctx) => {
   const input = ctx.resolve(inputRef!);
   const shape = ctx.node.meta.shape ?? input.shape;
   ctx.setOutput(ctx.createBuffer(shape), shape);
+};
+
+/** aten.ones_like.default — same shape as input, all ones. The value is a pure function
+ * of the (static) shape, never of input data, so it is uploaded once per node and
+ * cached for the model's lifetime: no kernel dispatch and no per-run buffer. */
+export const onesLikeHandler: OpHandler = (ctx) => {
+  const [inputRef] = ctx.node.args;
+  const input = ctx.resolve(inputRef!);
+  const shape = ctx.node.meta.shape ?? input.shape;
+  const n = numElements(shape);
+  const buffer = ctx.getOrUploadConstant(`ones_like:${ctx.node.name}:${n}`, () => new Float32Array(n).fill(1));
+  ctx.setOutput(buffer, shape);
 };

@@ -35,12 +35,14 @@ import { complexHandler, realHandler, imagHandler } from "./complex.js";
 import { groupNormHandler, layerNormHandler } from "./norm.js";
 import { clampHandler, powScalarHandler, rsubScalarHandler } from "./scalar.js";
 import { pixelShuffleHandler } from "./pixel_shuffle.js";
-import { sumHandler, linalgVectorNormHandler } from "./reduce.js";
+import { sumHandler, meanHandler, linalgVectorNormHandler } from "./reduce.js";
 import { gatherHandler } from "./gather.js";
 import { gatherDimHandler } from "./gather_dim.js";
 import { einsumHandler } from "./einsum.js";
 import { fftIrfft2Handler } from "./fft.js";
-import { passthroughHandler, zerosLikeHandler } from "./passthrough.js";
+import { passthroughHandler, zerosLikeHandler, onesLikeHandler } from "./passthrough.js";
+import { upsampleNearest2dHandler } from "./upsample.js";
+import { softmaxHandler } from "./softmax.js";
 
 /** target string -> handler, covering the natural aten aliases documented in each
  * kernel's WGSL header comment. Anything not listed here has no bundled kernel and
@@ -70,6 +72,7 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.rsqrt.default", rsqrtHandler],
   ["aten.hardswish.default", hardswishHandler],
   ["aten.clamp.default", clampHandler],
+  ["aten.clip.default", clampHandler],
   ["aten.pow.Tensor_Scalar", powScalarHandler],
   ["aten.rsub.Scalar", rsubScalarHandler],
   // shape / layout
@@ -93,14 +96,20 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.matmul.default", linearHandler],
   ["aten.mm.default", linearHandler],
   ["aten.linear.default", linearHandler],
+  // softmax (see ops/softmax.ts)
+  ["aten.softmax.int", softmaxHandler],
+  ["aten._softmax.default", softmaxHandler],
   // normalization
   ["aten.group_norm.default", groupNormHandler],
   ["aten.layer_norm.default", layerNormHandler],
   // reductions
   ["aten.sum.dim_IntList", sumHandler],
+  ["aten.mean.dim", meanHandler],
   ["aten.linalg_vector_norm.default", linalgVectorNormHandler],
   // upsampling / shuffling
   ["aten.pixel_shuffle.default", pixelShuffleHandler],
+  ["aten.upsample_nearest2d.vec", upsampleNearest2dHandler],
+  ["aten.upsample_nearest2d.default", upsampleNearest2dHandler],
   // gather / indexing
   ["aten.index.Tensor", gatherHandler],
   ["aten.gather.default", gatherDimHandler],
@@ -121,6 +130,7 @@ export const opRegistry: ReadonlyMap<string, OpHandler> = new Map<string, OpHand
   ["aten.squeeze.dim", passthroughHandler],
   ["aten.unsqueeze.default", passthroughHandler],
   ["aten.zeros_like.default", zerosLikeHandler],
+  ["aten.ones_like.default", onesLikeHandler],
 ]);
 
 export { findLinearWeightElisions };
