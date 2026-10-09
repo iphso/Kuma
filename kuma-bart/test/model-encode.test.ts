@@ -113,6 +113,21 @@ describe("KumaModel on a caller-provided device", () => {
     d.release();
   });
 
+  it("trimScratch() destroys idle sets beyond the kept count and leaves busy ones alone", () => {
+    const encoder = mock.device.createCommandEncoder();
+    const runs = Array.from({ length: 5 }, () => model.encode(new Map([["x", tensor(mock, [4])]]), encoder));
+    const held = runs[4]!;
+    runs.slice(0, 4).forEach((r) => r.release());
+    expect(model.activeEncodes).toBe(1);
+    const before = model.scratchBytes;
+    model.trimScratch(1);
+    expect(model.scratchBytes).toBe((before * 2) / 5); // one idle kept + the busy one
+    expect(mock.destroyedBuffers.has(held.outputs[0]!.buffer)).toBe(false);
+    held.release();
+    model.trimScratch(0);
+    expect(model.scratchBytes).toBe(0);
+  });
+
   it("rejects a missing input, a wrong shape, a wrong dtype, a short buffer, a misaligned offset and missing usage", () => {
     const encoder = mock.device.createCommandEncoder();
     expect(() => model.encode(new Map(), encoder)).toThrow(KumaManifestError);

@@ -212,6 +212,15 @@ export class KumaModel {
     return this.busySets.size;
   }
 
+  /** Destroys idle scratch sets beyond `keep` (default `maxInFlight`). Scratch is kept
+   * after `release()` so a steady stream of calls never reallocates, which also means a
+   * one-off burst of N unreleased encodes leaves N sets cached: call this after such a
+   * burst to give the memory back. Sets held by unreleased encodes are never touched. */
+  trimScratch(keep: number = this.maxInFlight): void {
+    const extra = this.idleSets.splice(Math.max(0, keep));
+    for (const set of extra) set.destroy();
+  }
+
   get inputs(): readonly IOSpec[] {
     return this.manifest.inputs;
   }

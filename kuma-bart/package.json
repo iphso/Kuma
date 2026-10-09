@@ -1,7 +1,7 @@
 {
   "name": "kuma-bart",
   "version": "0.0.1",
-  "description": "BAd RunTime for Kuma — a WebGPU interpreter for .iph packages.",
+  "description": "BAd RunTime for Kuma \u2014 a WebGPU interpreter for .iph packages.",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
@@ -20,7 +20,8 @@
     "typecheck": "tsc --noEmit",
     "build": "vite build",
     "test": "npm run typecheck && vitest run",
-    "demo": "vite --host 0.0.0.0 --config vite.demo.config.ts"
+    "demo": "vite --host 0.0.0.0 --config vite.demo.config.ts",
+    "test:gpu": "vitest run --config vitest.gpu.config.ts"
   },
   "dependencies": {
     "fflate": "^0.8.2",
@@ -33,5 +34,13 @@
     "vitest": "^2.1.4",
     "@webgpu/types": "latest",
     "@types/node": "^20.14.0"
+  },
+  "peerDependencies": {
+    "webgpu": ">=0.3.10"
+  },
+  "peerDependenciesMeta": {
+    "webgpu": {
+      "optional": true
+    }
   }
 }
