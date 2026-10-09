@@ -10,6 +10,11 @@
 export function createMockDevice(options: { features?: string[] } = {}) {
   const dispatches: number[] = [];
   const kernels: string[] = [];
+  /** Every `clearBuffer` recorded, in order (the scheduler's zero-fill of allocate-only nodes). */
+  const clears: object[] = [];
+  /** Every `copyBufferToBuffer` recorded: [source, sourceOffset, destination, destinationOffset, size]. */
+  const copies: Array<[object, number, object, number, number]> = [];
+  let submits = 0;
   const destroyedBuffers = new Set<object>();
   // A buffer in `createdBuffers` but not `destroyedBuffers` is still live.
   const createdBuffers = new Set<{ usage: number }>();
@@ -62,18 +67,38 @@ export function createMockDevice(options: { features?: string[] } = {}) {
     },
     createCommandEncoder: () => ({
       beginComputePass: () => pass,
-      copyBufferToBuffer: () => {},
+      copyBufferToBuffer: (src: object, srcOffset: number, dst: object, dstOffset: number, size: number) => {
+        copies.push([src, srcOffset, dst, dstOffset, size]);
+      },
+      clearBuffer: (buffer: object) => {
+        clears.push(buffer);
+      },
       resolveQuerySet: () => {},
       finish: () => ({}),
     }),
     queue: {
       writeBuffer: () => {},
-      submit: () => {},
+      submit: () => {
+        submits++;
+      },
       onSubmittedWorkDone: async () => {},
     },
   };
 
-  return { device: device as unknown as GPUDevice, pass, dispatches, kernels, destroyedBuffers, createdBuffers };
+  return {
+    device: device as unknown as GPUDevice,
+    pass,
+    dispatches,
+    kernels,
+    clears,
+    copies,
+    destroyedBuffers,
+    createdBuffers,
+    /** How many times queue.submit() was called so far. */
+    get submits() {
+      return submits;
+    },
+  };
 }
 
 export type MockDevice = ReturnType<typeof createMockDevice>;

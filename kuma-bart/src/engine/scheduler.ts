@@ -2,12 +2,14 @@ import { isNodeRef, nodeRefsIn, type ArgValue, type GraphNode, type KumaManifest
 import {
   OpContext,
   EncodeEnv,
+  pooledAllocator,
   type ResolvedTensor,
   type BufferPoolState,
   createBufferPoolState,
   acquireGenerationSlot,
   releaseGenerationSlot,
 } from "./context.js";
+import type { TransientSet } from "./transients.js";
 import { numElements } from "./shape.js";
 import { opRegistry, findLinearWeightElisions } from "../ops/index.js";
 import { KumaManifestError, KumaUnsupportedOpError } from "../errors.js";
@@ -15,7 +17,8 @@ import { readBuffers, uploadFloat32 } from "webgpu-compute-kit";
 import { getSnippetFn, type SnippetFn } from "./snippets.js";
 import { synthesizeWeight } from "./synthetic_weights.js";
 
-export interface RunGraphParams {
+/** What every graph walk needs: the model's static state plus this call's inputs. */
+export interface GraphParams {
   device: GPUDevice;
   manifest: KumaManifest;
   kernels: ReadonlyMap<string, string>;
@@ -42,6 +45,10 @@ export interface RunGraphParams {
    * in the same single batch as the real outputs. Names not present in the run (e.g. a
    * node the graph didn't reach) are silently omitted from the result. */
   captureNodes?: ReadonlySet<string>;
+}
+
+/** GraphParams plus the knobs of the submit-and-read-back path (encodeGraph/runGraph). */
+export interface RunGraphParams extends GraphParams {
   /** Skip the GPU->CPU readback for the manifest's own declared outputs -- `data` comes
    * back as an empty Float32Array(0) for them. Measured readback (mapAsync'ing a
    * multi-megabyte buffer back into JS) at 60-70ms for an 11MB frame, dwarfing the GPU
@@ -93,7 +100,8 @@ export interface SwitchResolution {
  * `switch` node's selector, and splices the chosen branch's nodes into the effective
  * execution list. Runs entirely before any GPU command encoder exists. Snippets may only
  * depend on model inputs so that branch selection never needs a mid-graph GPU readback.
- * The returned `seeded` buffers are freshly uploaded and owned by the caller.
+ * The returned `seeded` buffers come from `upload` (by default a fresh uploadFloat32 the
+ * caller owns).
  */
 export function resolveSwitches(
   device: GPUDevice,
@@ -101,6 +109,7 @@ export function resolveSwitches(
   rawInputs: ReadonlyMap<string, Float32Array>,
   snippetSources: ReadonlyMap<string, string>,
   snippetCache: Map<string, SnippetFn>,
+  upload: (data: Float32Array) => GPUBuffer = (data) => uploadFloat32(device, data),
 ): SwitchResolution {
   const flat: GraphNode[] = [];
   const seeded = new Map<string, ResolvedTensor>();
@@ -181,7 +190,7 @@ export function resolveSwitches(
       for (let i = 0; i < branchInputs.length; i++) {
         const arr = evalJsValue(outerArgs[i]!);
         const data = new Float32Array(arr);
-        seeded.set(branchInputs[i]!.node_ref, { buffer: uploadFloat32(device, data), shape: [data.length] });
+        seeded.set(branchInputs[i]!.node_ref, { buffer: upload(data), shape: [data.length] });
       }
 
       flat.push(...branch.nodes);
@@ -241,50 +250,64 @@ export interface EncodedGraph {
   freeOwned(keep: ReadonlySet<GPUBuffer>): void;
 }
 
-/** Resolves switches, walks the flattened graph in order (already topologically sorted by
- * the exporter) dispatching each node's op into one command encoder, and submits it. The
- * shared core of runGraph and profileGraph. Ownership rule: only buffers this call
- * allocated are ever destroyed here or by `freeOwned`. */
-export async function encodeGraph(params: RunGraphParams, options: EncodeOptions = {}): Promise<EncodedGraph> {
-  const { device, manifest, kernels, pipelineCache, weightBuffers, inputBuffers } = params;
+/** The flattened node list plus everything derived from it before any GPU work. */
+interface PreparedGraph {
+  nodes: GraphNode[];
+  seeded: Map<string, ResolvedTensor>;
+  elisions: Map<string, string>;
+  dispatchNodes: GraphNode[];
+}
+
+/** Switch resolution + registry check: everything that can fail before touching the
+ * encoder. `upload` seeds switch-branch inputs (see resolveSwitches). */
+function prepareGraph(params: GraphParams, upload?: (data: Float32Array) => GPUBuffer): PreparedGraph {
+  const { device, manifest } = params;
   const rawInputs = params.rawInputs ?? new Map<string, Float32Array>();
   const snippets = params.snippets ?? new Map<string, string>();
   const snippetCache = params.snippetCache ?? new Map<string, SnippetFn>();
-  const constantCache = params.constantCache ?? new Map<string, GPUBuffer>();
-  const bufferPool = params.bufferPool ?? createBufferPoolState();
-
-  const { nodes, seeded } = resolveSwitches(device, manifest.graph.nodes, rawInputs, snippets, snippetCache);
-  const owned = new Set<GPUBuffer>();
-  for (const t of seeded.values()) {
-    owned.add(t.buffer);
-    if (t.imag) owned.add(t.imag);
-  }
-  const destroyOwned = (buffer: GPUBuffer): void => {
-    if (owned.delete(buffer)) buffer.destroy();
-  };
-  const freeOwned = (keep: ReadonlySet<GPUBuffer>): void => {
-    for (const buffer of [...owned]) if (!keep.has(buffer)) destroyOwned(buffer);
-  };
-
+  const { nodes, seeded } = resolveSwitches(device, manifest.graph.nodes, rawInputs, snippets, snippetCache, upload);
   const elisions = findLinearWeightElisions(nodes);
   const dispatchNodes = nodes.filter((n) => n.op !== "placeholder" && n.op !== "output" && !elisions.has(n.name));
-  try {
-    for (const node of dispatchNodes) {
-      if (!opRegistry.has(node.target)) throw new KumaUnsupportedOpError(node.target, node.name);
-    }
-    options.prepare?.(dispatchNodes);
-  } catch (err) {
-    freeOwned(new Set());
-    throw err;
+  for (const node of dispatchNodes) {
+    if (!opRegistry.has(node.target)) throw new KumaUnsupportedOpError(node.target, node.name);
   }
+  return { nodes, seeded, elisions, dispatchNodes };
+}
 
-  // Must happen before any pooled buffer (via OpContext.createBuffer) gets reused for
-  // this call -- see acquireGenerationSlot's docs for what this does and doesn't wait for.
-  await acquireGenerationSlot(device, bufferPool);
+/** How a graph walk talks to whoever owns the command encoder. */
+interface WalkHooks {
+  /** The pass to record `node`'s dispatches into. */
+  pass(node: GraphNode): GPUComputePassEncoder;
+  /** Called right after `node`'s handler returned, with the pass it recorded into. */
+  afterNode?(node: GraphNode, pass: GPUComputePassEncoder): void;
+  /** `buffers` were handed to a node that dispatched nothing, so it is relying on them
+   * being zero-filled (e.g. aten.zeros_like) -- which a recycled buffer is not. The owner
+   * of the encoder must `clearBuffer` them, outside any open pass. */
+  clear(buffers: readonly GPUBuffer[]): void;
+  /** Liveness (when `track` is set): a buffer this walk resolved whose last consumer has
+   * just been encoded and that no other live or protected name still aliases. Weights,
+   * inputs and cached constants are reported too -- the hook decides what it owns. */
+  dead?(buffer: GPUBuffer): void;
+  /** After a node's liveness bookkeeping -- a chance to flush pending frees. */
+  afterLiveness?(): void;
+}
 
-  const env = new EncodeEnv(device, kernels, pipelineCache, bufferPool, constantCache, owned, seeded);
+interface WalkResult {
+  dispatchedNodes: GraphNode[];
+  outputTensors: ResolvedTensor[];
+  captured: Array<{ name: string; tensor: ResolvedTensor }>;
+}
+
+/** Walks the flattened graph in order (already topologically sorted by the exporter),
+ * resolving placeholders and dispatching each node's op through its handler, with the
+ * refcount liveness pass that drives early-free / transient recycling. Synchronous and
+ * encoder-agnostic: the hooks own passes, clears and frees. The shared core of
+ * encodeGraph (ring pool, submits) and recordGraph (caller's encoder, transient set). */
+function walkGraph(params: GraphParams, prepared: PreparedGraph, env: EncodeEnv, track: boolean, hooks: WalkHooks): WalkResult {
+  const { device, weightBuffers, inputBuffers } = params;
+  const { nodes, elisions } = prepared;
   const resolved = env.resolved;
-  const earlyFree = (options.earlyFree ?? false) && !options.nodePass;
+  const constantCache = env.constantCache;
 
   // Liveness pre-pass: how many later nodes consume each name, and which names must
   // survive the call (declared outputs and captured nodes).
@@ -310,113 +333,85 @@ export async function encodeGraph(params: RunGraphParams, options: EncodeOptions
     }
     return false;
   };
-
-  // Early-free is an allowlist: only buffers this call allocated (`owned`) are
-  // eligible, never weights, inputs, pooled or constant-cache buffers.
-  const pendingFree = new Set<GPUBuffer>();
-  let pendingFreeBytes = 0;
-  const earlyFreeSubmitBudget = params.earlyFreeSubmitBudget ?? EARLY_FREE_SUBMIT_BUDGET;
-  const markDead = (buf: GPUBuffer | undefined, ref: string): void => {
-    if (!buf || !owned.has(buf) || pendingFree.has(buf)) return;
-    if (bufferStillNeeded(buf, ref)) return;
-    pendingFree.add(buf);
-    pendingFreeBytes += buf.size;
+  const reportDead = (buf: GPUBuffer | undefined, ref: string): void => {
+    if (!buf || bufferStillNeeded(buf, ref)) return;
+    hooks.dead?.(buf);
   };
 
-  let encoder = device.createCommandEncoder();
-  let sharedPass = options.nodePass ? undefined : encoder.beginComputePass();
   let outputNode: GraphNode | undefined;
   const dispatchedNodes: GraphNode[] = [];
 
-  try {
-    for (const node of nodes) {
-      if (node.op === "placeholder") {
-        if (node.kind === "parameter" || node.kind === "buffer") {
-          const tensor = weightBuffers.get(node.weight_name!)
-            ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
-          if (!tensor) {
-            throw new KumaManifestError(
-              `Manifest references weight "${node.weight_name}" with no matching entry in weights[].`,
-            );
-          }
-          resolved.set(node.name, tensor);
-        } else {
-          const tensor = resolved.get(node.name) ?? inputBuffers.get(node.name);
-          if (!tensor) {
-            throw new KumaManifestError(`Missing input for placeholder "${node.name}" — pass it to KumaModel.run().`);
-          }
-          resolved.set(node.name, tensor);
-        }
-        continue;
-      }
-
-      if (node.op === "output") {
-        outputNode = node;
-        continue;
-      }
-
-      const aliasTarget = elisions.get(node.name);
-      if (aliasTarget !== undefined) {
-        const tensor = resolved.get(aliasTarget);
+  for (const node of nodes) {
+    if (node.op === "placeholder") {
+      if (node.kind === "parameter" || node.kind === "buffer") {
+        const tensor = weightBuffers.get(node.weight_name!)
+          ?? synthesizeWeight(device, constantCache, node.weight_name!, node.meta.shape ?? []);
         if (!tensor) {
           throw new KumaManifestError(
-            `Internal: elided transpose "${node.name}" aliases "${aliasTarget}" before it was resolved.`,
+            `Manifest references weight "${node.weight_name}" with no matching entry in weights[].`,
           );
         }
         resolved.set(node.name, tensor);
-        continue;
+      } else {
+        const tensor = resolved.get(node.name) ?? inputBuffers.get(node.name);
+        if (!tensor) {
+          throw new KumaManifestError(`Missing input for placeholder "${node.name}" — pass it to KumaModel.run().`);
+        }
+        resolved.set(node.name, tensor);
       }
+      continue;
+    }
 
-      const handler = opRegistry.get(node.target)!;
-      const pass = sharedPass ?? options.nodePass!(encoder, node);
-      handler(new OpContext(env, pass, node));
-      if (!sharedPass) pass.end();
-      dispatchedNodes.push(node);
+    if (node.op === "output") {
+      outputNode = node;
+      continue;
+    }
 
-      // Multi-output nodes (e.g. aten.chunk.default) register per-index results via
-      // setIndexedOutput instead of a single setOutput — nothing to check here for them.
-      if (node.meta.outputs === undefined && !resolved.has(node.name)) {
+    const aliasTarget = elisions.get(node.name);
+    if (aliasTarget !== undefined) {
+      const tensor = resolved.get(aliasTarget);
+      if (!tensor) {
         throw new KumaManifestError(
-          `Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`,
+          `Internal: elided transpose "${node.name}" aliases "${aliasTarget}" before it was resolved.`,
         );
       }
-
-      if (!earlyFree) continue;
-      for (const ref of nodeRefsIn(node.args)) {
-        const count = refCounts.get(ref);
-        if (count === undefined) continue;
-        refCounts.set(ref, count - 1);
-        if (count - 1 !== 0 || protectedNames.has(ref)) continue;
-        const tensor = resolved.get(ref);
-        if (!tensor) continue;
-        markDead(tensor.buffer, ref);
-        markDead(tensor.imag, ref);
-      }
-      if (pendingFree.size > 0 && pendingFreeBytes >= earlyFreeSubmitBudget) {
-        sharedPass!.end();
-        device.queue.submit([encoder.finish()]);
-        for (const buf of pendingFree) destroyOwned(buf);
-        pendingFree.clear();
-        pendingFreeBytes = 0;
-        encoder = device.createCommandEncoder();
-        sharedPass = encoder.beginComputePass();
-      }
+      resolved.set(node.name, tensor);
+      continue;
     }
-  } catch (err) {
-    releaseGenerationSlot(device, bufferPool);
-    freeOwned(new Set());
-    throw err;
+
+    const handler = opRegistry.get(node.target)!;
+    const pass = hooks.pass(node);
+    const ctx = new OpContext(env, pass, node);
+    handler(ctx);
+    hooks.afterNode?.(node, pass);
+    dispatchedNodes.push(node);
+
+    // Multi-output nodes (e.g. aten.chunk.default) register per-index results via
+    // setIndexedOutput instead of a single setOutput — nothing to check here for them.
+    if (node.meta.outputs === undefined && !resolved.has(node.name)) {
+      throw new KumaManifestError(
+        `Internal: op handler for "${node.target}" did not register an output for node "${node.name}".`,
+      );
+    }
+    // A handler that allocated but never dispatched is treating its buffers as zero-
+    // filled; a recycled buffer isn't, so make it so.
+    if (ctx.dispatchCount === 0 && ctx.createdBuffers.length > 0) hooks.clear(ctx.createdBuffers);
+
+    if (!track) continue;
+    for (const ref of nodeRefsIn(node.args)) {
+      const count = refCounts.get(ref);
+      if (count === undefined) continue;
+      refCounts.set(ref, count - 1);
+      if (count - 1 !== 0 || protectedNames.has(ref)) continue;
+      const tensor = resolved.get(ref);
+      if (!tensor) continue;
+      reportDead(tensor.buffer, ref);
+      reportDead(tensor.imag, ref);
+    }
+    hooks.afterLiveness?.();
   }
 
-  sharedPass?.end();
-  options.beforeSubmit?.(encoder);
-  device.queue.submit([encoder.finish()]);
-  releaseGenerationSlot(device, bufferPool);
-
-  if (!outputNode) {
-    freeOwned(new Set());
-    throw new KumaManifestError('Manifest graph has no "output" node.');
-  }
+  if (!outputNode) throw new KumaManifestError('Manifest graph has no "output" node.');
   const outputRefs = (outputNode.args[0] as NodeRef[] | undefined) ?? [];
   const outputTensors = outputRefs.map((ref) => {
     const tensor = resolved.get(ref.node_ref);
@@ -432,7 +427,157 @@ export async function encodeGraph(params: RunGraphParams, options: EncodeOptions
     if (tensor) captured.push({ name, tensor });
   }
 
-  return { dispatchedNodes, outputTensors, captured, owned, freeOwned };
+  return { dispatchedNodes, outputTensors, captured };
+}
+
+/** Resolves switches, walks the flattened graph dispatching each node's op into one
+ * command encoder of its own, and submits it. The core of runGraph and profileGraph.
+ * Scratch comes from the per-node ring pool (`params.bufferPool`, generation-rotated
+ * across calls via acquireGenerationSlot); buffers at or above the pool's size threshold
+ * are allocated fresh. Ownership rule: only buffers this call allocated are ever
+ * destroyed here or by `freeOwned`. For recording into a caller's encoder without
+ * submitting, see recordGraph. */
+export async function encodeGraph(params: RunGraphParams, options: EncodeOptions = {}): Promise<EncodedGraph> {
+  const { device, kernels, pipelineCache } = params;
+  const constantCache = params.constantCache ?? new Map<string, GPUBuffer>();
+  const bufferPool = params.bufferPool ?? createBufferPoolState();
+
+  const prepared = prepareGraph(params);
+  const owned = new Set<GPUBuffer>();
+  for (const t of prepared.seeded.values()) {
+    owned.add(t.buffer);
+    if (t.imag) owned.add(t.imag);
+  }
+  const destroyOwned = (buffer: GPUBuffer): void => {
+    if (owned.delete(buffer)) buffer.destroy();
+  };
+  const freeOwned = (keep: ReadonlySet<GPUBuffer>): void => {
+    for (const buffer of [...owned]) if (!keep.has(buffer)) destroyOwned(buffer);
+  };
+
+  try {
+    options.prepare?.(prepared.dispatchNodes);
+  } catch (err) {
+    freeOwned(new Set());
+    throw err;
+  }
+
+  // Must happen before any pooled buffer (via OpContext.createBuffer) gets reused for
+  // this call -- see acquireGenerationSlot's docs for what this does and doesn't wait for.
+  await acquireGenerationSlot(device, bufferPool);
+
+  const env = new EncodeEnv(device, kernels, pipelineCache, pooledAllocator(device, bufferPool, owned), constantCache, prepared.seeded);
+  const earlyFree = (options.earlyFree ?? false) && !options.nodePass;
+
+  // Early-free is an allowlist: only buffers this call allocated (`owned`) are
+  // eligible, never weights, inputs, pooled or constant-cache buffers.
+  const pendingFree = new Set<GPUBuffer>();
+  let pendingFreeBytes = 0;
+  const earlyFreeSubmitBudget = params.earlyFreeSubmitBudget ?? EARLY_FREE_SUBMIT_BUDGET;
+
+  let encoder = device.createCommandEncoder();
+  let sharedPass = options.nodePass ? undefined : encoder.beginComputePass();
+  const hooks: WalkHooks = {
+    pass: (node) => sharedPass ?? options.nodePass!(encoder, node),
+    afterNode: (_node, pass) => {
+      if (!sharedPass) pass.end();
+    },
+    clear: (buffers) => {
+      sharedPass?.end();
+      for (const buffer of buffers) encoder.clearBuffer(buffer);
+      if (sharedPass) sharedPass = encoder.beginComputePass();
+    },
+    dead: (buf) => {
+      if (!owned.has(buf) || pendingFree.has(buf)) return;
+      pendingFree.add(buf);
+      pendingFreeBytes += buf.size;
+    },
+    afterLiveness: () => {
+      if (pendingFree.size === 0 || pendingFreeBytes < earlyFreeSubmitBudget) return;
+      sharedPass!.end();
+      device.queue.submit([encoder.finish()]);
+      for (const buf of pendingFree) destroyOwned(buf);
+      pendingFree.clear();
+      pendingFreeBytes = 0;
+      encoder = device.createCommandEncoder();
+      sharedPass = encoder.beginComputePass();
+    },
+  };
+
+  let walked: WalkResult;
+  try {
+    walked = walkGraph(params, prepared, env, earlyFree, hooks);
+  } catch (err) {
+    releaseGenerationSlot(device, bufferPool);
+    freeOwned(new Set());
+    throw err;
+  }
+
+  sharedPass?.end();
+  options.beforeSubmit?.(encoder);
+  device.queue.submit([encoder.finish()]);
+  releaseGenerationSlot(device, bufferPool);
+
+  return { ...walked, owned, freeOwned };
+}
+
+export interface RecordGraphOptions {
+  /** The caller's encoder: every dispatch is recorded into it, and nothing is ever
+   * submitted here. The caller submits (or discards) it. */
+  encoder: GPUCommandEncoder;
+  /** Scratch for this encode: every intermediate and switch-seeded input comes from here
+   * and is recycled within the encode as soon as it is dead. Must be held exclusively
+   * by this encode until the encoder has been submitted; the caller then `reset()`s it. */
+  transients: TransientSet;
+}
+
+export interface RecordedGraph {
+  /** Nodes that dispatched, in encode order. */
+  dispatchedNodes: GraphNode[];
+  /** The manifest's declared outputs, in `output`-node order. Buffers from
+   * `transients` (or a weight/input a passthrough aliased) -- valid until the set is
+   * reset. */
+  outputTensors: ResolvedTensor[];
+  /** `captureNodes` that were actually resolved, in the caller's iteration order. */
+  captured: Array<{ name: string; tensor: ResolvedTensor }>;
+}
+
+/** Records the whole graph into `options.encoder` as one compute pass (split only around
+ * buffer clears) and returns, synchronously, without submitting or waiting: the shared-
+ * device path, where a caller batches several model encodes and its own kernels into
+ * one submission. Scratch is `options.transients` only, so two recordGraph calls into
+ * one encoder with two different sets never touch the same buffer. The ring pool and
+ * generation counter are not involved. */
+export function recordGraph(params: GraphParams, options: RecordGraphOptions): RecordedGraph {
+  const { device, kernels, pipelineCache } = params;
+  const { encoder, transients } = options;
+  const constantCache = params.constantCache ?? new Map<string, GPUBuffer>();
+
+  const prepared = prepareGraph(params, (data) => {
+    const buffer = transients.acquire("switch-seed", data.byteLength);
+    device.queue.writeBuffer(buffer, 0, data as unknown as Float32Array<ArrayBuffer>);
+    return buffer;
+  });
+  const env = new EncodeEnv(device, kernels, pipelineCache, transients, constantCache, prepared.seeded);
+
+  let pass = encoder.beginComputePass();
+  const hooks: WalkHooks = {
+    pass: () => pass,
+    clear: (buffers) => {
+      pass.end();
+      for (const buffer of buffers) encoder.clearBuffer(buffer);
+      pass = encoder.beginComputePass();
+    },
+    dead: (buf) => transients.free(buf),
+  };
+  try {
+    const walked = walkGraph(params, prepared, env, true, hooks);
+    pass.end();
+    return walked;
+  } catch (err) {
+    pass.end();
+    throw err;
+  }
 }
 
 /** Encodes and submits the graph (see encodeGraph), reads back the declared outputs plus

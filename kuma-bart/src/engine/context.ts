@@ -31,6 +31,17 @@ export { DEFAULT_BUFFER_POOL_DEPTH, DEFAULT_POOL_SIZE_THRESHOLD };
  * kernels/__init__.py). A kuma kernel-authoring convention, not a WebGPU constraint. */
 export const KERNEL_WORKGROUP_SIZE = 64;
 
+/** Where `OpContext.createBuffer` gets a node's scratch/output storage from. One encode
+ * shares one allocator across all of its nodes; the two implementations are the
+ * per-node ring pool (runGraph: `BufferPool` keyed by node + call index, generation-
+ * rotated across calls) and `TransientSet` (recordGraph: free-list reuse by size within
+ * one encode, held exclusively until the caller releases it). */
+export interface ScratchAllocator {
+  /** A storage buffer of at least `byteLength` bytes for the node-local `key`
+   * ("<node>::<createBuffer call index>"). */
+  acquire(key: string, byteLength: number): GPUBuffer;
+}
+
 export interface ResolvedTensor {
   buffer: GPUBuffer;
   shape: number[];
@@ -64,10 +75,23 @@ function bufferPoolFor(device: GPUDevice, state: BufferPoolState): BufferPool {
   return wrapper;
 }
 
+/** The ring-pool allocator runGraph/encodeGraph use: `BufferPool.acquire` per node key,
+ * with every buffer at or above the pool's size threshold (which the pool allocates fresh
+ * rather than pooling) recorded in `owned` for the caller to free. */
+export function pooledAllocator(device: GPUDevice, state: BufferPoolState, owned: Set<GPUBuffer>): ScratchAllocator {
+  const pool = bufferPoolFor(device, state);
+  return {
+    acquire(key, byteLength) {
+      const buffer = pool.acquire(key, byteLength);
+      if (byteLength >= state.sizeThreshold) owned.add(buffer);
+      return buffer;
+    },
+  };
+}
+
 /** Everything one graph-encoding call shares across all of its nodes. */
 export class EncodeEnv {
   readonly pipelines: PipelineCache;
-  readonly pool: BufferPool;
   /** Resolved results by node name (plus "<node>::<i>" for multi-output nodes). */
   readonly resolved: Map<string, ResolvedTensor>;
 
@@ -75,16 +99,13 @@ export class EncodeEnv {
     readonly device: GPUDevice,
     readonly kernels: ReadonlyMap<string, string>,
     pipelineCache: Map<string, GPUComputePipeline>,
-    readonly bufferPool: BufferPoolState,
+    /** Hands out every buffer `createBuffer` returns, including op-internal
+     * intermediates that never reach `resolved`; its owner frees or recycles them. */
+    readonly allocator: ScratchAllocator,
     readonly constantCache: Map<string, GPUBuffer>,
-    /** Receives every fresh (non-pooled) buffer `createBuffer` hands out, including
-     * op-internal intermediates that never reach `resolved` -- the caller owns freeing
-     * them. */
-    readonly ownedBuffers: Set<GPUBuffer>,
     seeded: ReadonlyMap<string, ResolvedTensor> = new Map(),
   ) {
     this.pipelines = pipelineCacheFor(device, pipelineCache);
-    this.pool = bufferPoolFor(device, bufferPool);
     this.resolved = new Map(seeded);
   }
 }
@@ -101,6 +122,11 @@ export class OpContext {
   // multi-step intermediates); each call gets its own cache slot / pool ring.
   private uniformCallIndex = 0;
   private createBufferCallIndex = 0;
+  /** Every buffer this node obtained from `createBuffer`, in order. */
+  readonly createdBuffers: GPUBuffer[] = [];
+  /** How many kernel dispatches this node recorded. A node that created a buffer and
+   * dispatched nothing is relying on it being zero-filled (see the scheduler). */
+  dispatchCount = 0;
 
   constructor(
     private readonly env: EncodeEnv,
@@ -133,19 +159,16 @@ export class OpContext {
     return tensor;
   }
 
-  /** A `shape`-sized output buffer from this node's pool ring, keyed by node name + which
-   * createBuffer call this is within the node. Safe to reuse across calls because kuma is
-   * a static-shape compiler (same key, same size); reuse timing is guarded by the
-   * scheduler's acquireGenerationSlot. Buffers >= the pool's sizeThreshold bypass the
-   * pool, are allocated fresh, and are recorded in `ownedBuffers` for the caller to
-   * free. */
+  /** A `shape`-sized f32 storage buffer for this node's output or scratch, from the
+   * encode's allocator (see ScratchAllocator), keyed by node name + which createBuffer
+   * call this is within the node. The scheduler owns its lifetime: a handler must not
+   * destroy it. Not guaranteed zero-filled (it is usually recycled); a handler that
+   * registers one as its output without writing to it gets it cleared by the scheduler. */
   createBuffer(shape: readonly number[]): GPUBuffer {
     const byteLength = numElements(shape) * 4;
     const key = `${this.node.name}::${this.createBufferCallIndex++}`;
-    const buffer = this.env.pool.acquire(key, byteLength);
-    if (byteLength >= this.env.bufferPool.sizeThreshold) {
-      this.env.ownedBuffers.add(buffer);
-    }
+    const buffer = this.env.allocator.acquire(key, byteLength);
+    this.createdBuffers.push(buffer);
     return buffer;
   }
 
@@ -240,6 +263,7 @@ export class OpContext {
           `a ${MAX_WORKGROUPS_PER_DIMENSION}x${MAX_WORKGROUPS_PER_DIMENSION} 2D dispatch grid's capacity.`,
       );
     }
+    this.dispatchCount++;
     this.env.pipelines.dispatchLinear(this.pass, this.getPipeline(kernelName), buffers, dispatchElements, KERNEL_WORKGROUP_SIZE);
   }
 
@@ -247,6 +271,7 @@ export class OpContext {
    * reads directly via `workgroup_id` (e.g. ceil(N/TILE), ceil(M/TILE) for a tiled matmul;
    * batch*channels as Z for a tiled conv), not element counts. */
   dispatchKernelGrid(kernelName: string, buffers: GPUBuffer[], gridX: number, gridY: number, gridZ: number = 1): void {
+    this.dispatchCount++;
     this.env.pipelines.dispatch(this.pass, this.getPipeline(kernelName), buffers, gridX, gridY, gridZ);
   }
 
