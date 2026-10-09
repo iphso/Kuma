@@ -1,6 +1,7 @@
 import { requestComputeDevice, uploadBufferSlice, uploadFloat32 } from "webgpu-compute-kit";
 import { loadIphPackage } from "../../src/iph/loader.js";
 import { runGraph, releaseOutputs } from "../../src/engine/scheduler.js";
+import { profileGraph, type ProfileReport } from "../../src/engine/profile.js";
 import { verifyAgainstGolden, type VerifyReport } from "../../src/engine/verify.js";
 import { createBufferPoolState, type BufferPoolState, type ResolvedTensor } from "../../src/engine/context.js";
 import type { SnippetFn } from "../../src/engine/snippets.js";
@@ -84,6 +85,23 @@ export class TerrainModel {
       const result: Record<string, Float32Array> = {};
       for (const out of outputs) result[out.name] = out.data;
       return result;
+    } finally {
+      for (const t of inputBuffers.values()) t.buffer.destroy();
+    }
+  }
+
+  /** profileGraph with the same inputs as run(): GPU-timestamped time per op class. */
+  async profile(inputs: Record<string, Float32Array>): Promise<ProfileReport> {
+    const inputBuffers = new Map<string, ResolvedTensor>();
+    const rawInputs = new Map<string, Float32Array>();
+    for (const spec of this.manifest.inputs) {
+      const data = inputs[spec.name];
+      if (!data) throw new Error(`missing input "${spec.name}"`);
+      inputBuffers.set(spec.name, { buffer: uploadFloat32(this.device, data), shape: spec.shape ?? [data.length] });
+      rawInputs.set(spec.name, data);
+    }
+    try {
+      return await profileGraph({ ...this.ctx(), manifest: this.manifest, inputBuffers, rawInputs });
     } finally {
       for (const t of inputBuffers.values()) t.buffer.destroy();
     }

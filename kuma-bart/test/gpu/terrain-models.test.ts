@@ -104,13 +104,25 @@ describe("terrain-diffusion packages on the GPU", () => {
       times.sort((a, b) => a - b);
       const median = times[Math.floor(times.length / 2)]!;
 
+      // GPU-timestamped per-op-class breakdown (percentages are the signal; the total
+      // runs high because every node gets its own pass).
+      let profileLine = "";
+      try {
+        const prof = await model.profile(ref.inputs);
+        const top = prof.byTarget.slice(0, 6).map((t) => `${t.target} ${(100 * t.totalMicroseconds / prof.totalMicroseconds).toFixed(0)}% (${t.count}x, ${(t.totalMicroseconds / 1000).toFixed(1)} ms)`);
+        profileLine = `\n  profile: ${(prof.totalMicroseconds / 1000).toFixed(1)} ms GPU over ${prof.perNode.length} passes; top: ${top.join(", ")}`;
+      } catch (err) {
+        profileLine = `\n  profile unavailable: ${(err as Error).message}`;
+      }
+
       console.log(
         `[terrain] ${stem} on ${describeNvidiaGpu(load)}: package ${(bytes.byteLength / 1e6).toFixed(1)} MB, load ${loadMs.toFixed(0)} ms, ` +
           `limits storage-binding ${(model.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB / buffer ${(model.limits.maxBufferSize / 2 ** 20).toFixed(0)} MiB, ` +
           `verify ${report.ok ? "ok" : "MISMATCH"} (${branch.nodesChecked} nodes, ${branch.mismatches.length} mismatching, ${branch.nodesMissing.length} missing)` +
           (summary.length ? `\n  first mismatches: ${summary.join("\n    ")}` : "") +
           `\n  output ${outName} ${JSON.stringify(ref.outputShape)}: ${fmt(stats)}` +
-          `\n  forward (run(), with readback): median ${median.toFixed(1)} ms, min ${times[0]!.toFixed(1)} ms over ${FORWARD_ITERS}`,
+          `\n  forward (run(), with readback): median ${median.toFixed(1)} ms, min ${times[0]!.toFixed(1)} ms over ${FORWARD_ITERS}` +
+          profileLine,
       );
 
       expect(stats.nonFinite).toBe(0);
