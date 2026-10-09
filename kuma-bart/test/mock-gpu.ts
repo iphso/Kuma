@@ -15,6 +15,7 @@ export function createMockDevice(options: { features?: string[] } = {}) {
   /** Every `copyBufferToBuffer` recorded: [source, sourceOffset, destination, destinationOffset, size]. */
   const copies: Array<[object, number, object, number, number]> = [];
   let submits = 0;
+  let deviceDestroyed = false;
   const destroyedBuffers = new Set<object>();
   // A buffer in `createdBuffers` but not `destroyedBuffers` is still live.
   const createdBuffers = new Set<{ usage: number }>();
@@ -49,6 +50,9 @@ export function createMockDevice(options: { features?: string[] } = {}) {
 
   const device = {
     features: new Set(options.features ?? []),
+    destroy: () => {
+      deviceDestroyed = true;
+    },
     createBuffer: ({ size, usage = 0 }: { size: number; usage?: number }) => fakeBuffer(size, usage),
     createShaderModule: () => ({}),
     createComputePipeline: ({ label }: { label?: string } = {}) => ({ label, getBindGroupLayout: () => ({}) }),
@@ -97,6 +101,10 @@ export function createMockDevice(options: { features?: string[] } = {}) {
     /** How many times queue.submit() was called so far. */
     get submits() {
       return submits;
+    },
+    /** Whether device.destroy() has been called. */
+    get deviceDestroyed() {
+      return deviceDestroyed;
     },
   };
 }

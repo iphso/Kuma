@@ -77,9 +77,12 @@ export interface RunGraphOutput {
   /** Set only for a captured node that happened to be complex-paired -- the manifest's
    * own declared outputs are always real in every model exported so far. */
   imag?: Float32Array;
-  /** Destroys `buffer` (and its imaginary-part buffer, if any) iff this run allocated
-   * it fresh; a no-op for pooled, weight, and caller-owned input buffers. Idempotent,
-   * and safe to call while GPU work using the buffer is still in flight. */
+  /** Gives `buffer` back. From runGraph: destroys it (and its imaginary-part buffer, if
+   * any) iff this run allocated it fresh; a no-op for pooled, weight, and caller-owned
+   * input buffers. From KumaModel.run, runRaw and runToGpu: once every output of that call has been
+   * released, the call's scratch set returns to the model and `buffer` may be reused by
+   * the next call. Idempotent, and safe to call while GPU work using the buffer is still
+   * in flight (reuse and destruction are queue-ordered). */
   release(): void;
 }
 

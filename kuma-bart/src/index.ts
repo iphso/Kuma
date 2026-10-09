@@ -1,5 +1,6 @@
 export { KumaModel } from "./model.js";
-export type { KumaMemoryOptions } from "./model.js";
+export type { KumaMemoryOptions, KumaLoadOptions, KumaEncodeOptions, EncodedRun } from "./model.js";
+export type { GpuTensor } from "./types/tensor.js";
 export { OnnxModel } from "./onnx/model.js";
 // <kuma-player> is deliberately not re-exported here: it extends HTMLElement, which would
 // break importing this entry under SSR/Node. Import "kuma-bart/player" to register it.

@@ -1,7 +1,7 @@
 import { loadIphPackage } from "./iph/loader.js";
-import { requestComputeDevice, uploadBufferSlice, uploadFloat32 } from "webgpu-compute-kit";
-import { runGraph, releaseOutputs, type RunGraphOutput, type RunGraphParams } from "./engine/scheduler.js";
-import { verifyAgainstGolden, warmUp, type VerifyReport } from "./engine/verify.js";
+import { readBuffers, requestComputeDevice, uploadBufferSlice, uploadFloat32 } from "webgpu-compute-kit";
+import { recordGraph, releaseOutputs, type RunGraphOutput } from "./engine/scheduler.js";
+import { verifyAgainstGolden, warmUp, type VerifyContext, type VerifyReport } from "./engine/verify.js";
 import { profileGraph, type ProfileReport } from "./engine/profile.js";
 import {
   createBufferPoolState,
@@ -10,10 +10,13 @@ import {
   type BufferPoolState,
   type ResolvedTensor,
 } from "./engine/context.js";
+import { TransientSet } from "./engine/transients.js";
+import { numElements } from "./engine/shape.js";
 import type { SnippetFn } from "./engine/snippets.js";
-import { KumaManifestError } from "./errors.js";
+import { KumaManifestError, KumaShapeError } from "./errors.js";
 import type { IOSpec, KumaManifest, PlaybackMeta } from "./types/manifest.js";
 import type { GoldenData } from "./types/golden.js";
+import type { GpuTensor } from "./types/tensor.js";
 
 /** Tuning knobs for how aggressively the runtime trades throughput for a smaller memory
  * footprint. All optional.
@@ -37,18 +40,56 @@ export interface KumaMemoryOptions {
    * Omit this entirely and `load()` guesses for you via webgpu-compute-kit's
    * isLikelyLowMemoryDevice (fallback/software adapter, or a low navigator.deviceMemory
    * reading) -- best-effort, since WebGPU has no portable free-VRAM query. Pass an
-   * explicit `true`/`false` to skip the guess. */
+   * explicit `true`/`false` to skip the guess. With a caller-provided `device` there is
+   * no adapter to guess from, so this defaults to false. */
   lowMemory?: boolean;
-  /** Buffer-pool ring depth. Default 3 (DEFAULT_BUFFER_POOL_DEPTH), or 1 when lowMemory;
-   * 1 disables rotation. Also caps how many frames KumaPlayer keeps in flight, since each
-   * in-flight frame needs its own live intermediates -- the dominant peak-memory term
-   * during playback. */
+  /** Recommended number of run()/runRaw()/runToGpu()/encode() calls to keep in flight
+   * (`maxInFlight`). Default 3 (DEFAULT_BUFFER_POOL_DEPTH), or 1 when lowMemory. Each
+   * in-flight call holds its own scratch set of live intermediates -- the dominant
+   * peak-memory term during playback -- so KumaPlayer caps its in-flight frames at this.
+   * Also the ring depth of the pool verify()/warmUp()/profile() run on. */
   bufferPoolDepth?: number;
-  /** Bytes at or above which a buffer skips the persistent pool and is freed eagerly.
-   * Default 1 MB. Lower it to shrink steady-state footprint toward just the weights, at
-   * the cost of more allocation churn and more mid-graph GPU submits. 0 = free everything
-   * eagerly. */
+  /** Bytes at or above which a buffer skips verify()/warmUp()/profile()'s persistent ring
+   * pool and is freed eagerly. Default 1 MB. Does not affect run()/encode(), whose scratch
+   * sets recycle every intermediate by liveness instead. */
   poolSizeThreshold?: number;
+}
+
+export interface KumaLoadOptions extends KumaMemoryOptions {
+  /** Run on this device instead of requesting a new one (shared-device mode): the model's
+   * weights, pipelines and scratch live on it, so a caller's own buffers on the same
+   * device can be passed straight to `encode()` and its outputs consumed by the caller's
+   * kernels. The caller keeps ownership: `destroy()` frees the model's resources but never
+   * destroys the device. `lowMemory` defaults to false (no adapter to guess from). */
+  device?: GPUDevice;
+}
+
+export interface KumaEncodeOptions {
+  /** CPU-side values of the inputs that `js_snippet` nodes read for branch routing
+   * (switch models only, e.g. the normalized time of a multi-segment export). Branch
+   * selection happens on the CPU while recording, before any GPU work, so a GPU buffer
+   * alone can't drive it. Required iff the package has js_snippet nodes; ignored otherwise. */
+  rawInputs?: ReadonlyMap<string, Float32Array>;
+  /** Write outputs into these caller-owned tensors (by manifest output name; any subset)
+   * instead of handing back scratch: one `copyBufferToBuffer` per output at the end of
+   * the encode, honouring `byteOffset` (needs COPY_DST usage). The returned `outputs`
+   * then reference the caller's tensors and stay valid after `release()`. */
+  outputs?: ReadonlyMap<string, GpuTensor>;
+}
+
+export interface EncodedRun {
+  /** The manifest's declared outputs, in manifest output order. Unless redirected via
+   * `KumaEncodeOptions.outputs`, each is scratch from this encode (or a weight/input a
+   * passthrough aliased) and is valid only until `release()` -- consume it in commands
+   * recorded before then (in the same encoder, or one submitted after it). */
+  outputs: GpuTensor[];
+  /** The same outputs keyed by manifest output name. */
+  outputsByName: ReadonlyMap<string, GpuTensor>;
+  /** Hands this encode's scratch back to the model for reuse. Call it once the encoder
+   * has been submitted (or discarded) and every consumer of the scratch `outputs` has
+   * been recorded; nothing waits for GPU completion -- buffer reuse by later submissions
+   * is queue-ordered. Idempotent. Never submits. */
+  release(): void;
 }
 
 function resolveMemoryOptions(
@@ -68,10 +109,27 @@ function resolveMemoryOptions(
   return { depth: Math.max(1, depth), sizeThreshold: Math.max(0, sizeThreshold) };
 }
 
+function sameShape(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((d, i) => d === b[i]);
+}
+
+function fmtShape(shape: readonly number[] | undefined): string {
+  return shape ? `[${shape.join(", ")}]` : "unknown";
+}
+
 /** A loaded `.iph` package, ready to run via WebGPU. */
 export class KumaModel {
+  /** Scratch sets not currently held by an unreleased encode (see TransientSet). */
+  private readonly idleSets: TransientSet[] = [];
+  private readonly busySets = new Set<TransientSet>();
+  /** Declared (or placeholder-derived) shape per input name; undefined when the
+   * package declares none (e.g. an ONNX-style export's scalar `norm_t`). */
+  private readonly inputShapes: ReadonlyMap<string, number[] | undefined>;
+  private readonly hasSnippets: boolean;
+
   private constructor(
     private readonly device: GPUDevice,
+    private readonly ownsDevice: boolean,
     private readonly manifest: KumaManifest,
     private readonly kernels: ReadonlyMap<string, string>,
     private readonly snippets: ReadonlyMap<string, string>,
@@ -81,14 +139,24 @@ export class KumaModel {
     private readonly golden: GoldenData | undefined,
     private readonly constantCache: Map<string, GPUBuffer>,
     private readonly bufferPool: BufferPoolState,
-  ) {}
+  ) {
+    const shapes = new Map<string, number[] | undefined>();
+    for (const spec of manifest.inputs) {
+      const placeholder = manifest.graph.nodes.find((n) => n.op === "placeholder" && n.name === spec.name);
+      shapes.set(spec.name, spec.shape ?? placeholder?.meta.shape);
+    }
+    this.inputShapes = shapes;
+    this.hasSnippets = manifest.graph.nodes.some((n) => n.op === "js_snippet");
+  }
 
   static async load(
     source: ArrayBuffer | Response | string,
-    memory: KumaMemoryOptions = {},
+    options: KumaLoadOptions = {},
   ): Promise<KumaModel> {
     const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(source);
-    const { device, isLikelyLowMemory } = await requestComputeDevice();
+    let device = options.device;
+    let isLikelyLowMemory = false;
+    if (!device) ({ device, isLikelyLowMemory } = await requestComputeDevice());
 
     const weightBuffers = new Map<string, ResolvedTensor>();
     for (const w of manifest.weights) {
@@ -96,9 +164,10 @@ export class KumaModel {
       weightBuffers.set(w.name, { buffer, shape: w.shape });
     }
 
-    const { depth, sizeThreshold } = resolveMemoryOptions(memory, isLikelyLowMemory);
+    const { depth, sizeThreshold } = resolveMemoryOptions(options, isLikelyLowMemory);
     return new KumaModel(
       device,
+      options.device === undefined,
       manifest,
       kernels,
       snippets,
@@ -111,26 +180,36 @@ export class KumaModel {
     );
   }
 
-  /** Read-only access to the GPU device this model's buffers/pipelines live on -- for
-   * a caller (e.g. the demo) that wants to render or otherwise consume a `runRaw()`/
-   * `runToGpu()` output's raw `buffer` entirely on-GPU, since WebGPU resources are
-   * device-scoped (you can't bind a buffer from this device into a pipeline created on
-   * another), or that wants to call `gpuDevice.queue.onSubmittedWorkDone()` itself for
-   * backpressure after a `runToGpu()` call. */
+  /** The GPU device this model's buffers/pipelines live on -- the one passed to
+   * `load({ device })`, or the model's own otherwise. WebGPU resources are
+   * device-scoped: every `GpuTensor` given to `encode()` must be a buffer of this device,
+   * and a `runRaw()`/`runToGpu()`/`encode()` output can only be consumed by pipelines
+   * created on it. Also where to call `queue.onSubmittedWorkDone()` for backpressure. */
   get gpuDevice(): GPUDevice {
     return this.device;
   }
 
-  /** How many run()/runRaw()/runToGpu() calls a caller should keep in flight at once.
-   * Equals this model's buffer-pool depth: submitting more than this doesn't get more
-   * frames genuinely in flight (runGraph's acquireGenerationSlot blocks at the top of the
-   * (depth+1)-th concurrent call until an earlier one's GPU work is confirmed done) and,
-   * more importantly here, each extra in-flight frame needs its own set of live
-   * intermediates -- the main thing a low-memory model is trying to avoid. KumaPlayer
-   * reads this instead of the BUFFER_POOL_DEPTH module constant so a model loaded with
-   * `{ lowMemory: true }` (depth 1) actually serializes to one frame at a time. */
+  /** How many run()/runRaw()/runToGpu()/encode() calls a caller should keep in flight at
+   * once (`bufferPoolDepth`, default 3, or 1 when lowMemory). Not a hard limit: each
+   * unreleased call holds its own scratch set of live intermediates, allocated on demand,
+   * so exceeding this costs memory rather than blocking. KumaPlayer reads this so a model
+   * loaded with `{ lowMemory: true }` actually serializes to one frame at a time. */
   get maxInFlight(): number {
     return this.bufferPool.depth;
+  }
+
+  /** Bytes currently held by run()/encode() scratch sets, idle or in use -- roughly
+   * (peak live activation bytes) x (most calls ever unreleased at once). */
+  get scratchBytes(): number {
+    let bytes = 0;
+    for (const set of this.idleSets) bytes += set.bytes;
+    for (const set of this.busySets) bytes += set.bytes;
+    return bytes;
+  }
+
+  /** Encodes recorded but not yet released. */
+  get activeEncodes(): number {
+    return this.busySets.size;
   }
 
   get inputs(): readonly IOSpec[] {
@@ -150,80 +229,245 @@ export class KumaModel {
     return this.manifest.playback;
   }
 
-  /** Immediately releases this model's GPU device and everything allocated from it --
-   * weight buffers, pooled/scratch buffers, pipelines -- in one call. Call this when
-   * done with a model (e.g. right before loading a different one into the same player)
-   * instead of just dropping the reference: each `load()` requests its own fresh
-   * GPUDevice (see requestComputeDevice), so an abandoned model's full buffer set
-   * otherwise lingers until JS GC gets around to collecting the whole device graph,
-   * not the instant its owner stops using it. Safe to call more than once (device
-   * destroy() is idempotent); every other method on this instance becomes unusable
-   * afterward since its underlying device is gone. */
+  /** Releases everything this model allocated. For a model that requested its own
+   * device (no `device` in load options) that is one `GPUDevice.destroy()`, which frees
+   * weights, scratch, pipelines and all in one go -- call it instead of just dropping the
+   * reference, or the whole buffer set lingers until JS GC collects the device graph. For
+   * a shared device the device is left alone and the model's weight, constant, pool and
+   * idle scratch buffers are destroyed individually (release every encode first; a set
+   * still held by an unreleased encode is not touched). Safe to call more than once;
+   * every other method on this instance is unusable afterward. */
   destroy(): void {
-    this.device.destroy();
+    if (this.ownsDevice) {
+      this.device.destroy();
+      return;
+    }
+    for (const t of this.weightBuffers.values()) {
+      t.buffer.destroy();
+      t.imag?.destroy();
+    }
+    for (const buffer of this.constantCache.values()) buffer.destroy();
+    this.constantCache.clear();
+    for (const slots of this.bufferPool.pools.values()) for (const buffer of slots) buffer?.destroy();
+    this.bufferPool.pools.clear();
+    for (const set of this.idleSets) set.destroy();
+    this.idleSets.length = 0;
+    this.pipelineCache.clear();
   }
 
-  private buildInputs(inputs: Record<string, Float32Array>): {
-    inputBuffers: Map<string, ResolvedTensor>;
-    rawInputs: Map<string, Float32Array>;
-  } {
-    const inputBuffers = new Map<string, ResolvedTensor>();
-    const rawInputs = new Map<string, Float32Array>();
+  /** Checks a caller's tensor against what `role` "`name`" needs: f32, the expected
+   * shape (when the package declares one), an aligned offset, enough bytes, and the
+   * usage the way it will be used requires. */
+  private checkTensor(
+    role: "Input" | "Output",
+    name: string,
+    tensor: GpuTensor,
+    expectedShape: readonly number[] | undefined,
+    usage: { flag: number; name: string },
+  ): { shape: number[]; byteOffset: number; byteLength: number } {
+    const where = `${role} "${name}"`;
+    if (tensor.dtype !== "f32") {
+      throw new KumaShapeError(`${where}: dtype "${String(tensor.dtype)}" is not supported -- kuma-bart tensors are f32.`);
+    }
+    if (expectedShape && !sameShape(tensor.shape, expectedShape)) {
+      throw new KumaShapeError(`${where} expected shape ${fmtShape(expectedShape)}, got ${fmtShape(tensor.shape)}.`);
+    }
+    const byteOffset = tensor.byteOffset ?? 0;
+    if (!Number.isInteger(byteOffset) || byteOffset < 0 || byteOffset % 4 !== 0) {
+      throw new KumaShapeError(`${where}: byteOffset ${byteOffset} must be a non-negative multiple of 4.`);
+    }
+    const byteLength = numElements(tensor.shape) * 4;
+    if (tensor.buffer.size < byteOffset + byteLength) {
+      throw new KumaShapeError(
+        `${where}: buffer is ${tensor.buffer.size} bytes, but shape ${fmtShape(tensor.shape)} at byteOffset ${byteOffset} needs ${byteOffset + byteLength}.`,
+      );
+    }
+    if ((tensor.buffer.usage & usage.flag) === 0) {
+      throw new KumaShapeError(`${where}: buffer was created without ${usage.name} usage, which binding it this way needs.`);
+    }
+    return { shape: [...tensor.shape], byteOffset, byteLength };
+  }
+
+  /** Records this model's whole graph into `encoder` -- one compute dispatch per node --
+   * reading `inputs` (GPU-resident, see GpuTensor for the layout) and returns the
+   * GPU-resident outputs, synchronously, without submitting or waiting. The caller
+   * submits the encoder whenever it likes, typically after recording its own kernels
+   * that consume the outputs and further `encode()` calls (any number of them: each
+   * takes its own scratch set, so nothing is shared between encodes in flight). Then
+   * `release()` each run once submitted.
+   *
+   * Inputs must match the manifest's names and declared shapes (KumaShapeError on a
+   * mismatch, KumaManifestError when one is missing), be f32 and live on `gpuDevice`
+   * (not checkable here -- see GpuTensor). Errors leave nothing recorded except an
+   * input copy that may already have been encoded. */
+  encode(inputs: ReadonlyMap<string, GpuTensor>, encoder: GPUCommandEncoder, opts: KumaEncodeOptions = {}): EncodedRun {
+    // Everything that can be checked without touching scratch, first.
+    const checked: Array<{ spec: IOSpec; tensor: GpuTensor; shape: number[]; byteOffset: number; byteLength: number }> = [];
     for (const spec of this.manifest.inputs) {
-      const data = inputs[spec.name];
-      if (!data) {
+      const tensor = inputs.get(spec.name);
+      if (!tensor) {
         throw new KumaManifestError(
           `Missing input "${spec.name}" — expected one of: ${this.manifest.inputs.map((s) => s.name).join(", ")}`,
         );
       }
-      const expected = spec.shape ? spec.shape.reduce((a, b) => a * b, 1) : data.length;
-      if (data.length !== expected) {
+      const offset = tensor.byteOffset ?? 0;
+      const usage = offset === 0 ? { flag: GPUBufferUsage.STORAGE, name: "STORAGE" } : { flag: GPUBufferUsage.COPY_SRC, name: "COPY_SRC" };
+      checked.push({ spec, tensor, ...this.checkTensor("Input", spec.name, tensor, this.inputShapes.get(spec.name), usage) });
+    }
+    if (this.hasSnippets && !opts.rawInputs) {
+      throw new KumaManifestError(
+        "This package routes between branches with js_snippet nodes, which read input values on the CPU: pass the routing inputs' values as encode(..., { rawInputs }).",
+      );
+    }
+
+    const set = this.idleSets.pop() ?? new TransientSet(this.device);
+    this.busySets.add(set);
+    const giveBack = (): void => {
+      set.reset();
+      this.busySets.delete(set);
+      this.idleSets.push(set);
+    };
+
+    let outputs: GpuTensor[];
+    try {
+      const inputBuffers = new Map<string, ResolvedTensor>();
+      for (const { spec, tensor, shape, byteOffset, byteLength } of checked) {
+        let buffer = tensor.buffer;
+        if (byteOffset !== 0) {
+          // Kernels bind whole buffers, so an offset input is staged by one GPU copy.
+          buffer = set.acquire(`input:${spec.name}`, byteLength);
+          encoder.copyBufferToBuffer(tensor.buffer, byteOffset, buffer, 0, byteLength);
+        }
+        inputBuffers.set(spec.name, { buffer, shape });
+      }
+
+      const recorded = recordGraph(
+        {
+          device: this.device,
+          manifest: this.manifest,
+          kernels: this.kernels,
+          pipelineCache: this.pipelineCache,
+          weightBuffers: this.weightBuffers,
+          inputBuffers,
+          rawInputs: opts.rawInputs,
+          snippets: this.snippets,
+          snippetCache: this.snippetCache,
+          constantCache: this.constantCache,
+        },
+        { encoder, transients: set },
+      );
+
+      outputs = this.manifest.outputs.map((spec, i) => {
+        const tensor = recorded.outputTensors[i]!;
+        const byteLength = numElements(tensor.shape) * 4;
+        const target = opts.outputs?.get(spec.name);
+        if (!target) return { buffer: tensor.buffer, shape: [...tensor.shape], dtype: "f32", byteOffset: 0 };
+        const dst = this.checkTensor("Output", spec.name, target, tensor.shape, { flag: GPUBufferUsage.COPY_DST, name: "COPY_DST" });
+        encoder.copyBufferToBuffer(tensor.buffer, 0, target.buffer, dst.byteOffset, byteLength);
+        return target;
+      });
+    } catch (err) {
+      giveBack();
+      throw err;
+    }
+
+    const outputsByName = new Map<string, GpuTensor>();
+    this.manifest.outputs.forEach((spec, i) => outputsByName.set(spec.name, outputs[i]!));
+    let released = false;
+    return {
+      outputs,
+      outputsByName,
+      release: () => {
+        if (released) return;
+        released = true;
+        giveBack();
+      },
+    };
+  }
+
+  /** Uploads CPU inputs (validated against the manifest), encodes and submits the graph
+   * in one command buffer, optionally reads the outputs back, and hands them out as
+   * RunGraphOutputs whose `release()` (all of them) returns the scratch to the model
+   * and frees the input uploads. */
+  private async runEncoded(inputs: Record<string, Float32Array>, readback: boolean): Promise<RunGraphOutput[]> {
+    const gpuInputs = new Map<string, GpuTensor>();
+    const rawInputs = new Map<string, Float32Array>();
+    const uploaded: GPUBuffer[] = [];
+    const destroyUploads = (): void => {
+      for (const buffer of uploaded) buffer.destroy();
+      uploaded.length = 0;
+    };
+    for (const spec of this.manifest.inputs) {
+      const data = inputs[spec.name];
+      if (!data) {
+        destroyUploads();
         throw new KumaManifestError(
-          `Input "${spec.name}" expected ${expected} elements (shape ${JSON.stringify(spec.shape)}), got ${data.length}.`,
+          `Missing input "${spec.name}" — expected one of: ${this.manifest.inputs.map((s) => s.name).join(", ")}`,
+        );
+      }
+      const shape = this.inputShapes.get(spec.name) ?? [data.length];
+      const expected = numElements(shape);
+      if (data.length !== expected) {
+        destroyUploads();
+        throw new KumaManifestError(
+          `Input "${spec.name}" expected ${expected} elements (shape ${JSON.stringify(shape)}), got ${data.length}.`,
         );
       }
       rawInputs.set(spec.name, data);
       const buffer = uploadFloat32(this.device, data);
-      inputBuffers.set(spec.name, { buffer, shape: spec.shape ?? [data.length] });
+      uploaded.push(buffer);
+      gpuInputs.set(spec.name, { buffer, shape, dtype: "f32" });
     }
-    return { inputBuffers, rawInputs };
-  }
 
-  /** Uploads `inputs`, runs `fn` against them, then destroys the uploaded buffers: this
-   * model owns its input uploads (runGraph never destroys caller-provided inputs).
-   * Destroying right after submit is safe -- WebGPU defers the actual free until the
-   * submitted work using them completes. */
-  private async withInputs<T>(
-    inputs: Record<string, Float32Array>,
-    fn: (params: RunGraphParams) => Promise<T>,
-  ): Promise<T> {
-    const { inputBuffers, rawInputs } = this.buildInputs(inputs);
+    const encoder = this.device.createCommandEncoder();
+    let run: EncodedRun;
     try {
-      return await fn({
-        device: this.device,
-        manifest: this.manifest,
-        kernels: this.kernels,
-        pipelineCache: this.pipelineCache,
-        weightBuffers: this.weightBuffers,
-        inputBuffers,
-        rawInputs,
-        snippets: this.snippets,
-        snippetCache: this.snippetCache,
-        constantCache: this.constantCache,
-        bufferPool: this.bufferPool,
-      });
-    } finally {
-      for (const t of inputBuffers.values()) t.buffer.destroy();
+      run = this.encode(gpuInputs, encoder, { rawInputs });
+    } catch (err) {
+      destroyUploads();
+      throw err;
     }
+    this.device.queue.submit([encoder.finish()]);
+
+    const datas = readback
+      ? await readBuffers(
+          this.device,
+          run.outputs.map((o) => ({ buffer: o.buffer, byteLength: numElements(o.shape) * 4 })),
+        )
+      : [];
+
+    // The uploads are freed with the scratch: an output may alias one (a passthrough-only
+    // graph), and destroy() while submitted work still references a buffer is fine.
+    let remaining = run.outputs.length;
+    const releaseAll = (): void => {
+      run.release();
+      destroyUploads();
+    };
+    if (remaining === 0) releaseAll();
+    return run.outputs.map((o, i) => {
+      let done = false;
+      return {
+        name: this.manifest.outputs[i]!.name,
+        shape: [...o.shape],
+        data: datas[i] ?? new Float32Array(0),
+        buffer: o.buffer,
+        release: () => {
+          if (done) return;
+          done = true;
+          if (--remaining === 0) releaseAll();
+        },
+      };
+    });
   }
 
   /** Like `run`, but returns the full RunGraphOutput[] (shape + the GPU buffer the
    * data was read back from, not just the data) -- for a caller that wants to render
    * or otherwise consume a result on-GPU. The caller owns the result: call each
-   * output's `release()` (or `releaseOutputs`) once done with its `buffer`, or outputs
-   * above the pool size threshold leak. */
+   * output's `release()` (or `releaseOutputs`); once every output of the call is
+   * released its scratch goes back to the model for the next call, so `buffer` is
+   * valid until then. */
   async runRaw(inputs: Record<string, Float32Array>): Promise<RunGraphOutput[]> {
-    return this.withInputs(inputs, (params) => runGraph(params));
+    return this.runEncoded(inputs, true);
   }
 
   /** Like `runRaw`, but skips the GPU->CPU readback for the model's own outputs
@@ -234,7 +478,7 @@ export class KumaModel {
    * (~2ms), so an interactive path that only needs pixels on screen should use this.
    * For real GPU compute time, see profile()'s realMilliseconds. */
   async runToGpu(inputs: Record<string, Float32Array>): Promise<RunGraphOutput[]> {
-    return this.withInputs(inputs, (params) => runGraph({ ...params, skipOutputReadback: true }));
+    return this.runEncoded(inputs, false);
   }
 
   async run(inputs: Record<string, Float32Array>): Promise<Record<string, Float32Array>> {
@@ -245,6 +489,20 @@ export class KumaModel {
       result[out.name] = out.data;
     }
     return result;
+  }
+
+  /** The ring-pool run parameters verify()/warmUp()/profile() share (see engine/verify.ts). */
+  private ringParams(): VerifyContext {
+    return {
+      device: this.device,
+      kernels: this.kernels,
+      pipelineCache: this.pipelineCache,
+      weightBuffers: this.weightBuffers,
+      snippets: this.snippets,
+      snippetCache: this.snippetCache,
+      constantCache: this.constantCache,
+      bufferPool: this.bufferPool,
+    };
   }
 
   /** Runs the same graph a real `run(inputs)` call would, but with GPU timestamp
@@ -261,7 +519,24 @@ export class KumaModel {
   async profile(
     inputs: Record<string, Float32Array>,
   ): Promise<ProfileReport & { realMilliseconds: number; baselineMilliseconds: number }> {
-    const report = await this.withInputs(inputs, (params) => profileGraph(params));
+    const inputBuffers = new Map<string, ResolvedTensor>();
+    const rawInputs = new Map<string, Float32Array>();
+    for (const spec of this.manifest.inputs) {
+      const data = inputs[spec.name];
+      if (!data) {
+        throw new KumaManifestError(
+          `Missing input "${spec.name}" — expected one of: ${this.manifest.inputs.map((s) => s.name).join(", ")}`,
+        );
+      }
+      rawInputs.set(spec.name, data);
+      inputBuffers.set(spec.name, { buffer: uploadFloat32(this.device, data), shape: this.inputShapes.get(spec.name) ?? [data.length] });
+    }
+    let report: ProfileReport;
+    try {
+      report = await profileGraph({ ...this.ringParams(), manifest: this.manifest, inputBuffers, rawInputs });
+    } finally {
+      for (const t of inputBuffers.values()) t.buffer.destroy();
+    }
 
     const baselineT0 = performance.now();
     await this.device.queue.onSubmittedWorkDone();
@@ -287,20 +562,7 @@ export class KumaModel {
         "This .iph package has no golden.json -- it was exported without example inputs to capture golden values with.",
       );
     }
-    return verifyAgainstGolden(
-      {
-        device: this.device,
-        kernels: this.kernels,
-        pipelineCache: this.pipelineCache,
-        weightBuffers: this.weightBuffers,
-        snippets: this.snippets,
-        snippetCache: this.snippetCache,
-        constantCache: this.constantCache,
-        bufferPool: this.bufferPool,
-      },
-      this.manifest,
-      this.golden,
-    );
+    return verifyAgainstGolden(this.ringParams(), this.manifest, this.golden);
   }
 
   /** Runs every branch once, directly against golden.json's own recorded reference
@@ -317,19 +579,6 @@ export class KumaModel {
    * the one graph. */
   async warmUp(): Promise<void> {
     if (!this.golden) return;
-    await warmUp(
-      {
-        device: this.device,
-        kernels: this.kernels,
-        pipelineCache: this.pipelineCache,
-        weightBuffers: this.weightBuffers,
-        snippets: this.snippets,
-        snippetCache: this.snippetCache,
-        constantCache: this.constantCache,
-        bufferPool: this.bufferPool,
-      },
-      this.manifest,
-      this.golden,
-    );
+    await warmUp(this.ringParams(), this.manifest, this.golden);
   }
 }
