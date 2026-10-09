@@ -84,8 +84,8 @@ export class KumaBackend implements PlayerBackend {
       const first = outputs[0];
       return first ? `${formatFps(elapsed)} enqueue  "${first.name}"  ${JSON.stringify(first.shape)}` : undefined;
     } finally {
-      // Fresh (non-pooled) output buffers are this caller's to free; destroy() on a
-      // device that is already gone is a safe no-op.
+      // Releasing every output hands the call's scratch set back to the model for the
+      // next frame; a no-op on a device that is already gone.
       releaseOutputs(outputs);
     }
   }
