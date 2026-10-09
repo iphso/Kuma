@@ -30,10 +30,14 @@ export class TerrainModel {
     readonly weightBuffers: Map<string, ResolvedTensor>,
     readonly golden: GoldenData | undefined,
     readonly limits: { maxStorageBufferBindingSize: number; maxBufferSize: number },
+    /** Time spent in loadIphPackage (unzip + inflate of the weight blob). */
+    readonly parseMs: number,
   ) {}
 
   static async load(bytes: ArrayBuffer): Promise<TerrainModel> {
+    const tParse0 = performance.now();
     const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(bytes);
+    const parseMs = performance.now() - tParse0;
     const { device } = await requestComputeDevice({
       // A minimum of 1 asks the kit for the adapter's full available value.
       requiredLimits: { maxStorageBufferBindingSize: 1, maxBufferSize: 1 },
@@ -48,7 +52,7 @@ export class TerrainModel {
     return new TerrainModel(device, manifest, kernels, snippets, weightBuffers, golden, {
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
       maxBufferSize: device.limits.maxBufferSize,
-    });
+    }, parseMs);
   }
 
   private ctx() {

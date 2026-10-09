@@ -116,7 +116,7 @@ describe("terrain-diffusion packages on the GPU", () => {
       }
 
       console.log(
-        `[terrain] ${stem} on ${describeNvidiaGpu(load)}: package ${(bytes.byteLength / 1e6).toFixed(1)} MB, load ${loadMs.toFixed(0)} ms, ` +
+        `[terrain] ${stem} on ${describeNvidiaGpu(load)}: package ${(bytes.byteLength / 1e6).toFixed(1)} MB, load ${loadMs.toFixed(0)} ms (unzip ${model.parseMs.toFixed(0)} ms), ` +
           `limits storage-binding ${(model.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB / buffer ${(model.limits.maxBufferSize / 2 ** 20).toFixed(0)} MiB, ` +
           `verify ${report.ok ? "ok" : "MISMATCH"} (${branch.nodesChecked} nodes, ${branch.mismatches.length} mismatching, ${branch.nodesMissing.length} missing)` +
           (summary.length ? `\n  first mismatches: ${summary.join("\n    ")}` : "") +
