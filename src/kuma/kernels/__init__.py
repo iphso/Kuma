@@ -11,6 +11,7 @@ _KERNEL_NAMES: tuple[str, ...] = (
     "mul.wgsl",
     "div.wgsl",
     "minimum.wgsl",
+    "binary_broadcast.wgsl",
     # elementwise unary / activations
     "relu.wgsl",
     "gelu.wgsl",  # approximate="tanh"

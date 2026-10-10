@@ -270,7 +270,19 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
     const g = new GraphBuilder();
     const { outputs, mock } = await runMock(g.output(g.op("scaled", "aten.mul.Tensor", [g.input("x", [4]), 32], [4])));
     expect(outputs[0]!.shape).toEqual([4]);
+    expect(mock.kernels).toEqual(["binary_broadcast.wgsl"]);
+  });
+
+  it("a literal scalar operand falls back to a materialized constant + mul.wgsl for packages without binary_broadcast.wgsl", async () => {
+    const g = new GraphBuilder();
+    const { mock } = await runMock(g.output(g.op("scaled", "aten.mul.Tensor", [g.input("x", [4]), 32], [4])), { missingKernels: ["binary_broadcast.wgsl"] });
     expect(mock.kernels).toEqual(["mul.wgsl"]);
+  });
+
+  it("a [1,C,1,1] operand is read in place by binary_broadcast.wgsl, not expanded first", async () => {
+    const g = new GraphBuilder();
+    const { mock } = await runMock(g.output(g.op("y", "aten.mul.Tensor", [g.input("x", [1, 3, 4, 4]), g.input("s", [1, 3, 1, 1])], [1, 3, 4, 4])));
+    expect(mock.kernels).toEqual(["binary_broadcast.wgsl"]);
   });
 
   it("aten.rsub.Scalar (scalar - tensor) dispatches sub.wgsl with a broadcast constant", async () => {
@@ -280,7 +292,7 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
     expect(mock.kernels).toEqual(["sub.wgsl"]);
   });
 
-  it("literal-operand constants are keyed by element count, not node name alone", async () => {
+  it("literal-operand constants: one 1-element buffer per value for binary ops, element-count keyed for rsub", async () => {
     const constantCache = new Map<string, GPUBuffer>();
     for (const n of [4, 8]) {
       const g = new GraphBuilder();
@@ -288,7 +300,7 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
       await runMock(g.output(g.op("result", "aten.rsub.Scalar", [x, 1.0], [n]), g.op("scaled", "aten.mul.Tensor", [x, 2], [n])), { constantCache });
     }
     const constantKeys = [...constantCache.keys()].filter((k) => !k.startsWith("params:")).sort();
-    expect(constantKeys).toEqual(["operand:scaled:b:4", "operand:scaled:b:8", "rsub:result:4", "rsub:result:8"]);
+    expect(constantKeys).toEqual(["rsub:result:4", "rsub:result:8", "scalar:2"]);
   });
 
   it("aten.rsub.Scalar with alpha != 1 fails loudly instead of computing the wrong thing", async () => {

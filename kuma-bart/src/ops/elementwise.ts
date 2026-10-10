@@ -1,7 +1,7 @@
 import type { OpContext, OpHandler, ResolvedTensor } from "../engine/context.js";
 import { isNodeRef, type ArgValue } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
-import { numElements } from "../engine/shape.js";
+import { expandStrides, numElements } from "../engine/shape.js";
 import { broadcastTensor } from "./expand.js";
 import { complexProduct, dispatchBinary, dispatchUnary } from "./complex_math.js";
 
@@ -52,6 +52,41 @@ function binaryOutputShape(ctx: OpContext, aArg: ArgValue, bArg: ArgValue): numb
   return ctx.resolve(tensorArg).shape;
 }
 
+const BROADCAST_OPS: Record<string, number> = { "add.wgsl": 0, "sub.wgsl": 1, "mul.wgsl": 2, "div.wgsl": 3, "minimum.wgsl": 4 };
+const BROADCAST_RANK_CAP = 4;
+
+/** Real operands of which at least one needs broadcasting (a scalar literal, or a tensor
+ * whose shape differs from the output's) go through binary_broadcast.wgsl's strided reads
+ * instead of being materialized at the output shape. Returns false -- leaving the
+ * materializing path -- for complex operands, rank > 4, same-shape operands (the flat
+ * kernel is cheaper) and packages exported before binary_broadcast.wgsl. */
+function tryBroadcastBinary(ctx: OpContext, kernelName: string, aArg: ArgValue, bArg: ArgValue, shape: readonly number[]): boolean {
+  const op = BROADCAST_OPS[kernelName];
+  if (op === undefined || shape.length > BROADCAST_RANK_CAP || !ctx.hasKernel("binary_broadcast.wgsl")) return false;
+  const side = (arg: ArgValue): { buffer: GPUBuffer; strides: number[]; same: boolean } | null => {
+    if (typeof arg === "number") {
+      // One f32 per distinct literal value, shared by every node that uses it.
+      const value = Math.fround(arg);
+      const buffer = ctx.getOrUploadConstant(`scalar:${Object.is(value, -0) ? "-0" : value}`, () => Float32Array.of(value));
+      return { buffer, strides: shape.map(() => 0), same: false };
+    }
+    const t = ctx.resolve(arg);
+    if (t.imag) return null;
+    return { buffer: t.buffer, strides: expandStrides(t.shape, shape), same: sameShape(t.shape, shape) };
+  };
+  const a = side(aArg);
+  const b = side(bArg);
+  if (!a || !b || (a.same && b.same)) return false;
+  const pad = BROADCAST_RANK_CAP - shape.length;
+  const padded = (xs: readonly number[], fill: number) => new Array(pad).fill(fill).concat(xs);
+  const n = numElements(shape);
+  const out = ctx.createBuffer(shape);
+  const params = ctx.uniform([...padded(shape, 1), ...padded(a.strides, 0), ...padded(b.strides, 0), n, op]);
+  ctx.dispatchKernel("binary_broadcast.wgsl", [a.buffer, b.buffer, out, params], n);
+  ctx.setOutput(out, shape);
+  return true;
+}
+
 type ComplexPolicy = "linear" | "multiply" | "divide" | "unsupported";
 
 function binaryElementwise(kernelName: string, complexPolicy: ComplexPolicy = "unsupported"): OpHandler {
@@ -62,6 +97,7 @@ function binaryElementwise(kernelName: string, complexPolicy: ComplexPolicy = "u
     if (!shape) {
       throw new KumaShapeError(`Op "${node.target}" (node "${node.name}") is missing an output shape in the manifest.`);
     }
+    if (tryBroadcastBinary(ctx, kernelName, aArg!, bArg!, shape)) return;
     const a = resolveOperand(ctx, aArg!, shape, "a");
     const b = resolveOperand(ctx, bArg!, shape, "b");
 
