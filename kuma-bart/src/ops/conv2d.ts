@@ -187,6 +187,19 @@ function dispatchConv2d(
     return;
   }
 
+  if (groups === 1 && ctx.hasKernel("conv2d_igemm.wgsl")) {
+    const out = ctx.createBuffer(outShape);
+    const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW]);
+    ctx.dispatchKernelGrid(
+      "conv2d_igemm.wgsl",
+      [input.buffer, weight.buffer, bias.buffer, out, params],
+      Math.ceil(outChannels / POINTWISE_TILE),
+      Math.ceil((batch * outH * outW) / POINTWISE_TILE),
+    );
+    ctx.setOutput(out, outShape);
+    return;
+  }
+
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
   ctx.dispatchKernel("conv2d.wgsl", [input.buffer, weight.buffer, bias.buffer, out, params], numElements(outShape));

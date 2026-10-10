@@ -302,6 +302,13 @@ describe("runGraph (mocked GPUDevice — structural checks only, no real compute
     const args = [g.input("x", [1, 3, 4, 4]), g.weight("w", [2, 3, 3, 3]), g.weight("b", [2])];
     const { outputs, mock } = await runMock(g.output(g.op("y", "aten.conv2d.default", args, [1, 2, 4, 4])));
     expect(outputs[0]!.shape).toEqual([1, 2, 4, 4]);
+    expect(mock.kernels).toEqual(["conv2d_igemm.wgsl"]);
+  });
+
+  it("a dense conv2d falls back to conv2d.wgsl for packages exported before conv2d_igemm.wgsl", async () => {
+    const g = new GraphBuilder();
+    const args = [g.input("x", [1, 3, 4, 4]), g.weight("w", [2, 3, 3, 3]), g.weight("b", [2])];
+    const { mock } = await runMock(g.output(g.op("y", "aten.conv2d.default", args, [1, 2, 4, 4])), { missingKernels: ["conv2d_igemm.wgsl"] });
     expect(mock.kernels).toEqual(["conv2d.wgsl"]);
   });
 

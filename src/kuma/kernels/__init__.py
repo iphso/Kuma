@@ -37,6 +37,7 @@ _KERNEL_NAMES: tuple[str, ...] = (
     "conv2d.wgsl",
     "conv2d_depthwise.wgsl",
     "conv2d_pointwise.wgsl",
+    "conv2d_igemm.wgsl",
     "conv_transpose2d.wgsl",
     # reductions
     "mean.wgsl",
