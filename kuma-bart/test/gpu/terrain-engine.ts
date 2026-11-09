@@ -1,5 +1,6 @@
-import { requestComputeDevice, uploadBufferSlice, uploadFloat32 } from "webgpu-compute-kit";
+import { requestComputeDevice, uploadFloat32 } from "webgpu-compute-kit";
 import { loadIphPackage } from "../../src/iph/loader.js";
+import { destroyWeights, uploadWeights, weightBytes } from "../../src/iph/weights.js";
 import { runGraph, releaseOutputs } from "../../src/engine/scheduler.js";
 import { profileGraph, type ProfileReport } from "../../src/engine/profile.js";
 import { verifyAgainstGolden, type VerifyReport } from "../../src/engine/verify.js";
@@ -34,9 +35,12 @@ export class TerrainModel {
     readonly parseMs: number,
   ) {}
 
-  static async load(bytes: ArrayBuffer): Promise<TerrainModel> {
+  /** `quantizedWeights` as in KumaLoadOptions: "gpu" keeps int8 weights int8 on the GPU,
+   * "widen" widens them to float32 on load (float32 packages: no difference). */
+  static async load(bytes: ArrayBuffer, options: { quantizedWeights?: "gpu" | "widen" } = {}): Promise<TerrainModel> {
     const tParse0 = performance.now();
-    const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(bytes);
+    const pkg = await loadIphPackage(bytes, { widenQuantized: options.quantizedWeights === "widen" });
+    const { manifest, kernels, snippets, golden } = pkg;
     const parseMs = performance.now() - tParse0;
     const { device } = await requestComputeDevice({
       // A minimum of 1 asks the kit for the adapter's full available value.
@@ -45,14 +49,16 @@ export class TerrainModel {
         throw new Error(`[webgpu] uncaptured error: ${e.message}`);
       },
     });
-    const weightBuffers = new Map<string, ResolvedTensor>();
-    for (const w of manifest.weights) {
-      weightBuffers.set(w.name, { buffer: uploadBufferSlice(device, weights, w.byte_offset, w.byte_length), shape: w.shape });
-    }
+    const weightBuffers = uploadWeights(device, pkg);
     return new TerrainModel(device, manifest, kernels, snippets, weightBuffers, golden, {
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
       maxBufferSize: device.limits.maxBufferSize,
     }, parseMs);
+  }
+
+  /** GPU bytes held by the weights (int8 payloads + scales, or float32). */
+  get weightBytes(): number {
+    return weightBytes(this.weightBuffers);
   }
 
   private ctx() {
@@ -112,7 +118,7 @@ export class TerrainModel {
   }
 
   destroy(): void {
-    for (const t of this.weightBuffers.values()) t.buffer.destroy();
+    destroyWeights(this.weightBuffers);
     for (const b of this.constantCache.values()) b.destroy();
     this.device.destroy();
   }

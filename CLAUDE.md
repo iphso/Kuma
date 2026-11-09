@@ -187,6 +187,7 @@ tests/
                          # branch validation (lengths/indices/output shapes), torch golden capture
   test_onnx_backend.py   # same models through backend="torch" and backend="onnx"
   test_onnx_branching.py # compile_branching_onnx_kuma structure + golden correctness
+  test_quantize.py       # int8 weight packages: layout, conversion, bit parity with Loom's fakequant
   test_onnx_converters.py # per-converter regressions (MatMul/Gemm/Gather/Conv/ConvTranspose/
                          # Flatten/GELU), folding/name-collision/golden-determinism checks
 ```
@@ -210,6 +211,7 @@ src/kuma/
                     # (shared stats code for the torch and ONNX paths)
   debug.py          # debug report generator (generate_debug_report)
   package_iph.py    # Package dataclass: .save() writes the .iph zip, .write_dir() writes loose files
+  quantize.py       # int8 weights: quantize_package / quantize_iph, `python -m kuma.quantize src dst`
   branching.py      # compile_branching: N torch.export'd branches + JS router -> one package
   branch_assembly.py # shared router/switch graph + branch namespacing/weight concatenation
                     # used by all three branching entry points
@@ -247,7 +249,9 @@ breaks the other silently.
 
 ## Key constraints (Step 1 scope)
 
-- Inference only, static shapes, float32 only.
+- Inference only, static shapes, float32 only -- except optional int8 *weight storage*
+  (`kuma.quantize`, `quantize="int8"`; format_version 1, see README "Int8 weights").
+  Activations and arithmetic stay float32.
 - `torch.export.export` is the primary capture path.
 - WGSL kernels are embedded in every `.iph` package, and `kuma-bart` does execute them now
   — but there's still no kernel fusion or general memory/buffer planning anywhere in the

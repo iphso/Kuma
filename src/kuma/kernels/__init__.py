@@ -68,6 +68,22 @@ _KERNEL_NAMES: tuple[str, ...] = (
 )
 
 
+# Kernels that read int8 weights (four per u32, one f32 scale per output channel) --
+# added only to quantized packages (kuma.quantize), so float32 packages are unchanged.
+_QUANT_KERNEL_NAMES: tuple[str, ...] = (
+    "dequant_q8.wgsl",
+    "linear_q8.wgsl",
+    "conv2d_pointwise_q8.wgsl",
+    "conv2d_igemm_q8.wgsl",
+)
+
+
+def load_quant_kernels() -> dict[str, bytes]:
+    """Return {filename: wgsl_source_bytes} for the int8-weight kernels."""
+    kernels_dir = resources.files("kuma.kernels")
+    return {name: kernels_dir.joinpath(name).read_bytes() for name in _QUANT_KERNEL_NAMES}
+
+
 def load_kernels() -> dict[str, bytes]:
     """Return {filename: wgsl_source_bytes} for every kernel bundled with Kuma."""
     kernels_dir = resources.files("kuma.kernels")

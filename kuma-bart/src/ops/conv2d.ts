@@ -1,4 +1,4 @@
-import type { OpContext, ResolvedTensor } from "../engine/context.js";
+import { isPerChannelInt8, type OpContext, type ResolvedTensor } from "../engine/context.js";
 import type { ArgValue } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
@@ -9,6 +9,14 @@ const DEPTHWISE_TILE = 16;
 // (WebGPU's guaranteed-minimum maxComputeWorkgroupStorageSize, 16KB / 4 bytes).
 const DEPTHWISE_PATCH_CAPACITY = 4096;
 const POINTWISE_TILE = 64;
+
+/** The kernel + weight bindings for a GEMM-style conv: `<base>_q8.wgsl` with (int8
+ * weight, scales) when the weight is per-output-channel int8 and the package ships that
+ * kernel, else `<base>.wgsl` with a float32 weight (widened if it was int8). */
+export function gemmWeight(ctx: OpContext, weight: ResolvedTensor, base: string): [string, GPUBuffer[]] {
+  if (isPerChannelInt8(weight) && ctx.hasKernel(`${base}_q8.wgsl`)) return [`${base}_q8.wgsl`, [weight.buffer, weight.quant.scales]];
+  return [`${base}.wgsl`, [ctx.widen(weight).buffer]];
+}
 
 /** in_channels_per_group === 1 (every output channel depends on exactly one input
  * channel, no cross-channel reduction) routes to the halo-tiled depthwise kernel
@@ -46,6 +54,7 @@ function tryDispatchConv2dDepthwise(
     return false;
   }
 
+  weight = ctx.widen(weight);
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
   const gridX = Math.ceil(outW / DEPTHWISE_TILE);
@@ -88,9 +97,10 @@ function tryDispatchConv2dPointwise(
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, strideH, strideW, padH, padW]);
   const rows = batch * outH * outW;
+  const [kernel, weightBuffers] = gemmWeight(ctx, weight, "conv2d_pointwise");
   ctx.dispatchKernelGrid(
-    "conv2d_pointwise.wgsl",
-    [input.buffer, weight.buffer, bias.buffer, out, params],
+    kernel,
+    [input.buffer, ...weightBuffers, bias.buffer, out, params],
     Math.ceil(outChannels / POINTWISE_TILE),
     Math.ceil(rows / POINTWISE_TILE),
   );
@@ -190,9 +200,10 @@ function dispatchConv2d(
   if (groups === 1 && ctx.hasKernel("conv2d_igemm.wgsl")) {
     const out = ctx.createBuffer(outShape);
     const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW]);
+    const [kernel, weightBuffers] = gemmWeight(ctx, weight, "conv2d_igemm");
     ctx.dispatchKernelGrid(
-      "conv2d_igemm.wgsl",
-      [input.buffer, weight.buffer, bias.buffer, out, params],
+      kernel,
+      [input.buffer, ...weightBuffers, bias.buffer, out, params],
       Math.ceil(outChannels / POINTWISE_TILE),
       Math.ceil((batch * outH * outW) / POINTWISE_TILE),
     );
@@ -202,7 +213,7 @@ function dispatchConv2d(
 
   const out = ctx.createBuffer(outShape);
   const params = ctx.uniform([batch, inChannels, inH, inW, outChannels, outH, outW, kh, kw, strideH, strideW, padH, padW, groups]);
-  ctx.dispatchKernel("conv2d.wgsl", [input.buffer, weight.buffer, bias.buffer, out, params], numElements(outShape));
+  ctx.dispatchKernel("conv2d.wgsl", [input.buffer, ctx.widen(weight).buffer, bias.buffer, out, params], numElements(outShape));
   ctx.setOutput(out, outShape);
 }
 
@@ -231,7 +242,7 @@ export function conv2dHandler(ctx: OpContext): void {
   }
 
   const input = ctx.resolve(inputRef);
-  const weight = ctx.resolve(weightRef);
+  const weight = ctx.resolveWeight(weightRef);
   dispatchConv2d(ctx, input, weight, biasRef, strideArg, paddingArg, dilationArg, groupsArg);
 }
 
@@ -255,6 +266,6 @@ export function conv2dSimpleHandler(ctx: OpContext): void {
   const groupsArg = (node.args[6] as number | undefined) ?? 1;
 
   const input = ctx.resolve(inputRef);
-  const weight = ctx.resolve(weightRef);
+  const weight = ctx.resolveWeight(weightRef);
   dispatchConv2d(ctx, input, weight, biasRef, strideArg, paddingArg, dilationArg, groupsArg);
 }

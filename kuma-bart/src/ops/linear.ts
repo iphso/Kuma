@@ -1,4 +1,5 @@
 import type { OpContext, ResolvedTensor } from "../engine/context.js";
+import { gemmWeight } from "./conv2d.js";
 import { isNodeRef, nodeRefsIn, type ArgValue, type GraphNode } from "../types/manifest.js";
 import { KumaShapeError, KumaUnsupportedOpError } from "../errors.js";
 import { numElements } from "../engine/shape.js";
@@ -23,7 +24,9 @@ export function dispatchLinear(ctx: OpContext, x: ResolvedTensor, weight: Resolv
   // via workgroup_id, not folded into a linear dispatchElements count (see its header).
   const gridX = Math.ceil(n / LINEAR_TILE);
   const gridY = Math.ceil(m / LINEAR_TILE);
-  ctx.dispatchKernelGrid("linear.wgsl", [x.buffer, weight.buffer, bias.buffer, out, params], gridX, gridY);
+  // An int8 weight (per output channel) runs linear_q8.wgsl; see gemmWeight.
+  const [kernel, weightBuffers] = gemmWeight(ctx, weight, "linear");
+  ctx.dispatchKernelGrid(kernel, [x.buffer, ...weightBuffers, bias.buffer, out, params], gridX, gridY);
   return { buffer: out, shape: outShape };
 }
 
@@ -129,7 +132,7 @@ export function linearHandler(ctx: OpContext): void {
   }
 
   const x = ctx.resolve(xRef);
-  const weight = ctx.resolve(weightRef);
+  const weight = ctx.resolveWeight(weightRef);
 
   if (weight.shape.length !== 2 || x.shape.length < 1 || x.shape[x.shape.length - 1] !== weight.shape[1]) {
     throw new KumaShapeError(

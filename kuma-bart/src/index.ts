@@ -10,7 +10,9 @@ export { KumaManifestError, KumaShapeError, KumaUnsupportedOpError } from "./err
 // real pool depth): past this, runGraph's acquireGenerationSlot blocks on GPU completion.
 export { BUFFER_POOL_DEPTH } from "./engine/context.js";
 export { releaseOutputs } from "./engine/scheduler.js";
-export type { KumaManifest, IOSpec, WeightEntry, GraphNode, NodeRef, ArgValue, PlaybackMeta } from "./types/manifest.js";
+export { loadIphPackage, type IphPackage, type LoadIphOptions } from "./iph/loader.js";
+export { dequantizeWeight, widenQuantizedWeights, uploadWeights, weightBytes, hasQuantizedWeights } from "./iph/weights.js";
+export type { KumaManifest, IOSpec, WeightEntry, WeightQuant, GraphNode, NodeRef, ArgValue, PlaybackMeta } from "./types/manifest.js";
 export type { GoldenData, GoldenBranch, GoldenNodeStats, GoldenTensorStats } from "./types/golden.js";
 export type { VerifyReport, BranchVerifyReport, NodeDiff, FieldDiff } from "./engine/verify.js";
 export type { ProfileReport, OpTiming, TargetTiming } from "./engine/profile.js";

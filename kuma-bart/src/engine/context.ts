@@ -50,6 +50,25 @@ export interface ResolvedTensor {
    * aten.complex.default (see ops/complex.ts). No kernel ever sees an interleaved
    * complex buffer; real/imag are always two separate same-shape real GPUBuffers. */
   imag?: GPUBuffer;
+  /** Set for an int8 weight kept int8 on the GPU (see iph/weights.ts): `buffer` then holds
+   * the int8 values, four per u32 (little-endian, zero-padded to 4 bytes), and the
+   * logical float32 value of element i is f32(q[i]) * scales[floor(i / groupSize)].
+   * Only handlers with an int8 kernel ever see this (via OpContext.resolveWeight);
+   * OpContext.resolve hands every other consumer a widened float32 copy. */
+  quant?: QuantInfo;
+}
+
+export interface QuantInfo {
+  /** The weight's manifest name -- keys the cached widened copy. */
+  name: string;
+  groupSize: number;
+  scales: GPUBuffer;
+}
+
+/** True when `t` is int8 with one scale per dim-0 slice (output channel) -- the layout
+ * the *_q8 GEMM kernels read. */
+export function isPerChannelInt8(t: ResolvedTensor): t is ResolvedTensor & { quant: QuantInfo } {
+  return t.quant !== undefined && t.shape.length >= 1 && t.quant.groupSize * t.shape[0]! === numElements(t.shape);
 }
 
 // The kit wrappers are stateless views over a model's own pipeline Map / pool state, so
@@ -94,6 +113,8 @@ export class EncodeEnv {
   readonly pipelines: PipelineCache;
   /** Resolved results by node name (plus "<node>::<i>" for multi-output nodes). */
   readonly resolved: Map<string, ResolvedTensor>;
+  /** int8 weights already widened in this encode (OpContext.widen), by weight name. */
+  readonly widened = new Map<string, ResolvedTensor>();
 
   constructor(
     readonly device: GPUDevice,
@@ -144,7 +165,16 @@ export class OpContext {
     return this.env.kernels.has(kernelName);
   }
 
+  /** The tensor `arg` refers to, always float32: an int8 weight is widened on the GPU
+   * (see `widen`). Handlers that can consume int8 directly use `resolveWeight`. */
   resolve(arg: ArgValue): ResolvedTensor {
+    const tensor = this.resolveWeight(arg);
+    return tensor.quant ? this.widen(tensor) : tensor;
+  }
+
+  /** Like `resolve`, but an int8 weight comes back as-is (`quant` set): for handlers with
+   * an int8 kernel. A handler that gets one and can't use it must call `widen`. */
+  resolveWeight(arg: ArgValue): ResolvedTensor {
     if (!isNodeRef(arg)) {
       throw new KumaShapeError(
         `Op "${this.node.target}" (node "${this.node.name}") expected a tensor reference, got ${JSON.stringify(arg)}.`,
@@ -157,6 +187,30 @@ export class OpContext {
       );
     }
     return tensor;
+  }
+
+  /** A float32 view of an int8 weight: dispatches dequant_q8.wgsl (in this node's pass,
+   * so it is ordered before the consumer) into a buffer cached for the model's lifetime
+   * per weight. Dispatched once per encode per weight -- cheap next to the consumer, and
+   * keeps a recorded/replayed encode self-contained -- but it costs a float32 copy's
+   * memory, so only consumers without an int8 kernel should get here. */
+  widen(tensor: ResolvedTensor): ResolvedTensor {
+    const quant = tensor.quant;
+    if (!quant) return tensor;
+    const done = this.env.widened.get(quant.name);
+    if (done) return done;
+    const n = numElements(tensor.shape);
+    const key = `dequant:${quant.name}:${n}`;
+    let out = this.env.constantCache.get(key);
+    if (!out) {
+      out = createStorageBuffer(this.env.device, n * 4);
+      this.env.constantCache.set(key, out);
+    }
+    const params = this.cachedUniform(`params:dequant:${quant.name}:${n}:${quant.groupSize}`, () => packParams([n, quant.groupSize]));
+    this.dispatchKernel("dequant_q8.wgsl", [tensor.buffer, quant.scales, out, params], n);
+    const widened = { buffer: out, shape: tensor.shape };
+    this.env.widened.set(quant.name, widened);
+    return widened;
   }
 
   /** A `shape`-sized f32 storage buffer for this node's output or scratch, from the

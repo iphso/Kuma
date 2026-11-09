@@ -28,26 +28,41 @@ class Package:
     # Optional model blobs (e.g. ONNX files) written to models/ in the zip. Populated
     # by the onnx compiler path; empty for standard Kuma/WGSL packages.
     models: dict[str, bytes] = field(default_factory=dict)
+    # int8 weights (weights.q8.bin) of a quantized package -- see kuma.quantize. None for
+    # a float32 package.
+    quant_weights_blob: bytes | None = None
 
     # Above this, weights.f32.bin is stored uncompressed by default: float32 weights deflate
     # by only ~5-10% while inflating them dominates load time (8.7 s of a 9.8 s load for a
     # 1 GB blob in kuma-bart, measured with Dawn in Node).
     STORE_WEIGHTS_FROM_BYTES = 64 * 1024 * 1024
 
+    @property
+    def weight_file(self) -> str:
+        return self.manifest.get("weight_file", "weights.f32.bin")
+
+    @property
+    def quant_weight_file(self) -> str:
+        return self.manifest.get("quant_weight_file", "weights.q8.bin")
+
     def save(self, out: str | Path, *, compress_weights: bool | None = None) -> Path:
         """Write the self-contained .iph package (a zip archive) to `out`.
 
-        `compress_weights` picks deflate (True) or stored (False) for weights.f32.bin;
-        None (default) deflates blobs under STORE_WEIGHTS_FROM_BYTES and stores larger
-        ones. Everything else in the zip is always deflated."""
+        `compress_weights` picks deflate (True) or stored (False) for weights.f32.bin (and
+        weights.q8.bin of a quantized package); None (default) deflates each blob under
+        STORE_WEIGHTS_FROM_BYTES and stores larger ones. Everything else in the zip is always deflated."""
         out = Path(out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        if compress_weights is None:
-            compress_weights = len(self.weights_blob) < self.STORE_WEIGHTS_FROM_BYTES
-        weights_compression = zipfile.ZIP_DEFLATED if compress_weights else zipfile.ZIP_STORED
+        def compression(blob: bytes) -> int:
+            deflate = compress_weights if compress_weights is not None else len(blob) < self.STORE_WEIGHTS_FROM_BYTES
+            return zipfile.ZIP_DEFLATED if deflate else zipfile.ZIP_STORED
+
+        weights_compression = compression(self.weights_blob)
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(self.manifest, indent=2, sort_keys=True))
-            zf.writestr("weights.f32.bin", self.weights_blob, compress_type=weights_compression)
+            zf.writestr(self.weight_file, self.weights_blob, compress_type=weights_compression)
+            if self.quant_weights_blob is not None:
+                zf.writestr(self.quant_weight_file, self.quant_weights_blob, compress_type=compression(self.quant_weights_blob))
             for name, source in self.kernels.items():
                 zf.writestr(f"kernels/{name}", source)
             for name, source in self.snippets.items():
@@ -66,7 +81,9 @@ class Package:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         (out_dir / "manifest.json").write_text(json.dumps(self.manifest, indent=2, sort_keys=True))
-        (out_dir / "weights.f32.bin").write_bytes(self.weights_blob)
+        (out_dir / self.weight_file).write_bytes(self.weights_blob)
+        if self.quant_weights_blob is not None:
+            (out_dir / self.quant_weight_file).write_bytes(self.quant_weights_blob)
         (out_dir / "exported_graph.json").write_text(json.dumps(self.graph_data, indent=2))
         (out_dir / "debug_report.md").write_text(self.debug_report)
         if self.golden is not None:

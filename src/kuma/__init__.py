@@ -5,6 +5,7 @@ from kuma.compiler import compile, export_exported_program, export_model
 from kuma.onnx_backend import compile_branching_onnx_kuma, export_via_onnx
 from kuma.onnx_compiler import compile_branching_onnx, compile_onnx
 from kuma.package_iph import Package
+from kuma.quantize import quantize_iph, quantize_package
 
 __version__ = "0.1.0"
 
@@ -18,4 +19,6 @@ __all__ = [
     "export_model",
     "export_via_onnx",
     "Package",
+    "quantize_iph",
+    "quantize_package",
 ]

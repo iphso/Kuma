@@ -24,6 +24,7 @@ def compile(
     *,
     fps: float | None = None,
     duration_seconds: float | None = None,
+    quantize: str | None = None,
 ) -> Package:
     """Compile a captured ExportedProgram into an in-memory Package.
 
@@ -37,7 +38,13 @@ def compile(
     or played back, `duration_seconds` is how many real seconds a full sweep should take;
     a runtime (e.g. kuma-bart's demo) uses it instead of guessing/hardcoding one fixed
     speed for every model. See manifest.json's optional top-level "playback" key.
+
+    `quantize="int8"` stores every float32 tensor of >= 4096 elements as int8 with a scale
+    per output channel (kuma.quantize); the package then has no golden.json, since the
+    eager reference is the float32 model. None (default) keeps float32 weights.
     """
+    if quantize not in (None, "int8"):
+        raise ValueError(f"compile: unknown quantize {quantize!r}; expected None or 'int8'")
     graph_data = serialize_graph(ep)
     weights_blob, weight_entries, skipped = pack_weights(ep)
     warnings = [f"skipped non-float32 tensor: {s}" for s in skipped]
@@ -51,7 +58,7 @@ def compile(
     # uniform shape for a runtime's verifier to consume either way.
     golden = {"format_version": 0, "branches": [capture_golden(ep, example_inputs)]} if example_inputs is not None else None
 
-    return Package(
+    package = Package(
         manifest=manifest,
         weights_blob=weights_blob,
         graph_data=graph_data,
@@ -60,6 +67,11 @@ def compile(
         skipped=skipped,
         golden=golden,
     )
+    if quantize == "int8":
+        from kuma.quantize import quantize_package
+
+        package = quantize_package(package)
+    return package
 
 
 def export_exported_program(
@@ -69,9 +81,10 @@ def export_exported_program(
     *,
     fps: float | None = None,
     duration_seconds: float | None = None,
+    quantize: str | None = None,
 ) -> Path:
     """Compile an already-captured ExportedProgram and save it as a .iph package."""
-    return compile(ep, example_inputs, fps=fps, duration_seconds=duration_seconds).save(out)
+    return compile(ep, example_inputs, fps=fps, duration_seconds=duration_seconds, quantize=quantize).save(out)
 
 
 def export_model(
@@ -82,6 +95,7 @@ def export_model(
     backend: str = "torch",
     fps: float | None = None,
     duration_seconds: float | None = None,
+    quantize: str | None = None,
 ) -> Path:
     """Capture `model` and save the result as a .iph package.
 
@@ -89,13 +103,18 @@ def export_model(
     backend="onnx"   — torch.onnx.export first, then ONNX -> Kuma graph
                        (kuma.onnx_backend.export_via_onnx)
 
-    Any other backend raises ValueError.
+    Any other backend raises ValueError. `quantize="int8"`: see compile().
     """
     if backend == "onnx":
-        return export_via_onnx(
-            model, example_inputs, fps=fps, duration_seconds=duration_seconds
-        ).save(out)
+        package = export_via_onnx(model, example_inputs, fps=fps, duration_seconds=duration_seconds)
+        if quantize is not None:
+            if quantize != "int8":
+                raise ValueError(f"export_model: unknown quantize {quantize!r}; expected None or 'int8'")
+            from kuma.quantize import quantize_package
+
+            package = quantize_package(package)
+        return package.save(out)
     if backend != "torch":
         raise ValueError(f"export_model: unknown backend {backend!r}; expected 'torch' or 'onnx'")
     ep = export_program(model, example_inputs)
-    return export_exported_program(ep, out, example_inputs, fps=fps, duration_seconds=duration_seconds)
+    return export_exported_program(ep, out, example_inputs, fps=fps, duration_seconds=duration_seconds, quantize=quantize)

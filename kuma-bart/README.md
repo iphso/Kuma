@@ -112,6 +112,10 @@ The first use of a compute pipeline triggers WebGPU shader compilation. For a mu
 
 `model.warmUp()` runs every switch branch once (against `golden.json`'s reference inputs, bypassing the time-based router) to populate the pipeline cache and buffer pool ahead of interactive use. Shader compilation happens during the already-expected load wait.
 
+### Int8 weights
+
+A `format_version: 1` package (root README, "Int8 weights") holds large tensors as int8 with a float32 scale per output channel. `loadIphPackage(src, { widenQuantized: true })` widens them to float32 on the CPU while loading (a float32 model from there on: only the download shrinks). By default (`KumaModel.load(src, { quantizedWeights: "gpu" })`) they stay int8 on the GPU, four per `u32` (`iph/weights.ts`, `ResolvedTensor.quant` carrying the scales): `linear_q8.wgsl`, `conv2d_pointwise_q8.wgsl` and `conv2d_igemm_q8.wgsl` read them directly, dequantizing with the same single f32 multiply while filling the weight tile, so their outputs equal the float32 kernels' on the widened weights exactly. Handlers opt in with `OpContext.resolveWeight`; every other consumer goes through `OpContext.resolve`, which widens on the GPU (`dequant_q8.wgsl`, once per encode, into a buffer cached per weight -- that costs a float32 copy, so the hot ops should have an int8 kernel). Core WGSL only (`extractBits`), no f16/int8 extensions. Measured on the terrain U-Nets (RTX 5000 Ada): weight memory 4x smaller (base 1015 -> 254 MB), conv GPU time ~8% lower.
+
 ## Known gaps
 
 - No general memory planner. `encode()`'s scratch set reuses buffers across nodes with disjoint live ranges, but only by exact size (a greedy free list), and the ring-pool path (`verify`/`profile`) only frees large intermediates early.

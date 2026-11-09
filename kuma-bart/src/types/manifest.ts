@@ -11,13 +11,30 @@ export interface IOSpec {
   kind?: string;
 }
 
+/** How an int8 weight dequantizes (format_version 1, written by kuma.quantize): element
+ * i is f32(q[i]) * scale[floor(i / group_size)], scales being `scale_count` float32 at
+ * byte `scale_offset` of the manifest's `weight_file`. group_size is the product of the
+ * trailing dims for a rank >= 2 tensor (one scale per output channel). */
+export interface WeightQuant {
+  scheme: "int8_symmetric";
+  group_size: number;
+  scale_dtype: "float32";
+  scale_offset: number;
+  scale_count: number;
+}
+
 export interface WeightEntry {
   name: string;
   shape: number[];
+  /** "float32", or "int8" for a quantized tensor (then `file` and `quant` are set). */
   dtype: string;
   n_elements: number;
   byte_offset: number;
   byte_length: number;
+  /** Which blob byte_offset points into: absent = the manifest's `weight_file`. int8
+   * tensors live in `quant_weight_file`, each 4-byte aligned and zero-padded to 4. */
+  file?: string;
+  quant?: WeightQuant;
 }
 
 export interface NodeMeta {
@@ -75,10 +92,16 @@ export interface PlaybackMeta {
   duration_seconds?: number;
 }
 
+/** The highest manifest format_version this runtime reads: 0 = float32 weights only,
+ * 1 = may hold int8 weights (`quant_weight_file`, WeightEntry.quant). */
+export const MAX_FORMAT_VERSION = 1;
+
 export interface KumaManifest {
   format: string;
   format_version: number;
   weight_file: string;
+  /** Present iff some weights are int8 (format_version 1): the int8 blob's zip entry. */
+  quant_weight_file?: string;
   endianness: "little" | "big";
   inputs: IOSpec[];
   outputs: IOSpec[];

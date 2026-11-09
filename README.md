@@ -62,6 +62,10 @@ A `.iph` file is a zip archive. Unzip it and you get:
 
 The manifest carries the full FX graph from `torch.export` — every node, its op target (`aten.convolution.default`, etc.), its arguments (tensor args become `{"node_ref": "<node_name>"}`), and a `weight_name` on placeholder nodes that maps back into the weight table. To reconstruct a weight: slice `weights.f32.bin` at `[byte_offset : byte_offset + byte_length]`, interpret as little-endian float32, reshape to `shape`.
 
+### Int8 weights (format_version 1)
+
+`python -m kuma.quantize in.iph out.iph` converts a saved float32 package (no torch model needed); `kuma.export_model(..., quantize="int8")` / `kuma.compile(ep, quantize="int8")` does it at export. Every float32 tensor of >= 4096 elements becomes symmetric int8 with one float32 scale per output channel (dim 0); smaller tensors (biases, gains) stay float32. Element `i` is `float32(q[i]) * scale[i // group_size]`, the same rounding as Loom's `py/quant/fakequant.py int8`. The package then has `format_version: 1`, a `quant_weight_file` (`weights.q8.bin`: int8 values, each tensor 4-byte aligned and padded to 4), and int8 entries in the weight table: `dtype: "int8"`, `file`, and `quant: {scheme: "int8_symmetric", group_size, scale_dtype, scale_offset, scale_count}`, the scales being float32 in `weights.f32.bin`. The int8 kernels (`*_q8.wgsl`) are added and `golden.json` is dropped (it describes the float32 model; `--keep-golden` keeps it). Float32 packages are unchanged (`format_version: 0`). kuma-bart keeps int8 weights int8 on the GPU by default (`KumaModel.load(src, { quantizedWeights: "gpu" | "widen" })`, see kuma-bart/README.md).
+
 The kernels are embedded in every package rather than fetched from a CDN or compiled at runtime — the package is intentionally self-contained, loadable from a plain file server with no build step.
 
 `playback` metadata (`fps`, `duration_seconds`) is optional, only present if the caller provided it at export time. If your model takes a normalized time input and you want the player to know how fast to run it, pass those values through — they're not recoverable from the graph otherwise.

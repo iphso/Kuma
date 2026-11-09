@@ -1,5 +1,6 @@
 import { loadIphPackage } from "./iph/loader.js";
-import { readBuffers, requestComputeDevice, uploadBufferSlice, uploadFloat32 } from "webgpu-compute-kit";
+import { DEQUANT_KERNEL, destroyWeights, hasQuantizedWeights, uploadWeights, weightBytes, widenQuantizedWeights } from "./iph/weights.js";
+import { readBuffers, requestComputeDevice, uploadFloat32 } from "webgpu-compute-kit";
 import { recordGraph, releaseOutputs, type RunGraphOutput } from "./engine/scheduler.js";
 import { verifyAgainstGolden, warmUp, type VerifyContext, type VerifyReport } from "./engine/verify.js";
 import { profileGraph, type ProfileReport } from "./engine/profile.js";
@@ -62,6 +63,13 @@ export interface KumaLoadOptions extends KumaMemoryOptions {
    * kernels. The caller keeps ownership: `destroy()` frees the model's resources but never
    * destroys the device. `lowMemory` defaults to false (no adapter to guess from). */
   device?: GPUDevice;
+  /** What to do with an int8 package's weights (kuma.quantize; float32 packages are
+   * unaffected). "gpu" (default): keep them int8 on the GPU -- 1 byte per weight -- read
+   * directly by the int8 linear/conv kernels and widened per use on the GPU for any other
+   * consumer. "widen": widen to float32 while loading (a float32 model in GPU memory and
+   * speed; only the download is smaller). A package without kernels/dequant_q8.wgsl is
+   * always widened. */
+  quantizedWeights?: "gpu" | "widen";
 }
 
 export interface KumaEncodeOptions {
@@ -153,16 +161,20 @@ export class KumaModel {
     source: ArrayBuffer | Response | string,
     options: KumaLoadOptions = {},
   ): Promise<KumaModel> {
-    const { manifest, weights, kernels, snippets, golden } = await loadIphPackage(source);
+    const pkg = await loadIphPackage(source);
+    let { manifest, weights } = pkg;
+    const { quantWeights, kernels, snippets, golden } = pkg;
+    let keepInt8 = (options.quantizedWeights ?? "gpu") === "gpu";
+    if (keepInt8 && hasQuantizedWeights(manifest) && !kernels.has(DEQUANT_KERNEL)) {
+      console.warn(`[kuma-bart] int8 package without kernels/${DEQUANT_KERNEL}; widening its weights to float32 on load.`);
+      keepInt8 = false;
+    }
+    if (!keepInt8 && quantWeights) ({ manifest, weights } = widenQuantizedWeights({ manifest, weights, quantWeights }));
     let device = options.device;
     let isLikelyLowMemory = false;
     if (!device) ({ device, isLikelyLowMemory } = await requestComputeDevice());
 
-    const weightBuffers = new Map<string, ResolvedTensor>();
-    for (const w of manifest.weights) {
-      const buffer = uploadBufferSlice(device, weights, w.byte_offset, w.byte_length);
-      weightBuffers.set(w.name, { buffer, shape: w.shape });
-    }
+    const weightBuffers = uploadWeights(device, { manifest, weights, quantWeights: keepInt8 ? quantWeights : undefined });
 
     const { depth, sizeThreshold } = resolveMemoryOptions(options, isLikelyLowMemory);
     return new KumaModel(
@@ -221,6 +233,12 @@ export class KumaModel {
     for (const set of extra) set.destroy();
   }
 
+  /** GPU bytes held by the model's weights (int8 payloads and scales included; not the
+   * per-use float32 copies of int8 weights consumed by ops without an int8 kernel). */
+  get weightBytes(): number {
+    return weightBytes(this.weightBuffers);
+  }
+
   get inputs(): readonly IOSpec[] {
     return this.manifest.inputs;
   }
@@ -251,10 +269,8 @@ export class KumaModel {
       this.device.destroy();
       return;
     }
-    for (const t of this.weightBuffers.values()) {
-      t.buffer.destroy();
-      t.imag?.destroy();
-    }
+    destroyWeights(this.weightBuffers);
+    for (const t of this.weightBuffers.values()) t.imag?.destroy();
     for (const buffer of this.constantCache.values()) buffer.destroy();
     this.constantCache.clear();
     for (const slots of this.bufferPool.pools.values()) for (const buffer of slots) buffer?.destroy();
