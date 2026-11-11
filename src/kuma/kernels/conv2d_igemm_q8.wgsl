@@ -7,8 +7,8 @@
 // Each weight is dequantized as f32(q) * scale[oc] while filling b_tile (load_b_tile) --
 // the same single f32 multiply a loader widening to float32 does -- so this kernel
 // computes bit-for-bit what the float32 kernel computes on the widened weights, reading
-// 1 byte per weight instead of 4. Uses only core WGSL (extractBits on i32
-// sign-extends); no f16/int8 extensions.
+// 1 byte per weight instead of 4. Uses only core WGSL (extractBits on i32 sign-extends); no f16/int8
+// extensions.
 
 const TILE_M: u32 = 64u;
 const TILE_N: u32 = 64u;
